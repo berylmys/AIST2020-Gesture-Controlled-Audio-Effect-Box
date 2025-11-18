@@ -6,15 +6,11 @@ import librosa
 import soundfile as sf
 from sklearn.cluster import KMeans
 
-# soundExtracting.py
-#
-# Small utility to extract, analyze and slice audio files into foley samples.
+# Utility to extract, analyze and slice audio files into foley samples.
 # Usage examples:
 #   python soundExtracting.py --input myfile.wav --outdir samples
 #   python soundExtracting.py --input-folder ./recordings --outdir ./slices --min-duration 0.05
-#
-# Requires: librosa, soundfile, numpy, scikit-learn (optional, for clustering)
-# pip install librosa soundfile numpy scikit-learn
+
 
 
 def find_audio_files(path):
