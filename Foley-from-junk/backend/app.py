@@ -8,7 +8,6 @@ import json
 
 app = Flask(__name__)
 
-# cors configuration
 CORS(app, resources={
     r"/api/*": {
         "origins": "*",
@@ -17,23 +16,18 @@ CORS(app, resources={
     }
 })
 
-# file upload size limit (500mb)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 
-# allowed video formats
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'flv', 'wmv', 'webm'}
 
-# create necessary folders
 os.makedirs('uploads', exist_ok=True)
 os.makedirs('outputs', exist_ok=True)
 
 def allowed_file(filename):
-    """check if file extension is allowed"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """health check endpoint"""
     return jsonify({
         'status': 'ok',
         'message': 'backend is running on port 5001!',
@@ -43,7 +37,6 @@ def health_check():
 
 @app.route('/api/upload-video', methods=['POST', 'OPTIONS'])
 def upload_video():
-    """upload video file"""
     if request.method == 'OPTIONS':
         return '', 204
     
@@ -106,7 +99,6 @@ def upload_video():
 
 @app.route('/api/detect-scenes', methods=['POST', 'OPTIONS'])
 def detect_scenes():
-    """detect scenes in video"""
     if request.method == 'OPTIONS':
         return '', 204
     
@@ -138,7 +130,6 @@ def detect_scenes():
         print(f"processing: {video_path}")
         print(f"  scenes: {n_scenes}, sensitivity: {sensitivity}")
         
-        # call detection script
         result = subprocess.run([
             'python', 'autoSceneDetector.py',
             '--video', video_path,
@@ -173,7 +164,6 @@ def detect_scenes():
 
 @app.route('/api/get-scenes', methods=['GET'])
 def get_scenes():
-    """get scene detection results"""
     try:
         scenes_file = os.path.join('outputs', 'scenes.json')
         
@@ -197,7 +187,6 @@ def get_scenes():
 
 @app.route('/api/download-scenes', methods=['GET'])
 def download_scenes():
-    """download scene json file"""
     try:
         scenes_file = os.path.join('outputs', 'scenes.json')
         
@@ -216,7 +205,6 @@ def download_scenes():
 
 @app.route('/api/video/<filename>')
 def get_video(filename):
-    """get video file"""
     try:
         filepath = os.path.join('uploads', filename)
         if not os.path.exists(filepath):
