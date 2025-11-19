@@ -10,7 +10,10 @@ import numpy as np
 import librosa
 import soundfile as sf
 from moviepy.editor import VideoFileClip
+import shutil
 from sklearn.cluster import KMeans
+import soundExtracting
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -19,9 +22,13 @@ app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 UPLOAD_FOLDER = 'uploads'
 OUTPUT_FOLDER = 'outputs'
 SLICES_FOLDER = 'outputs/slices'
+FOLEY_FOLDER = 'outputs/foley_library'
+FOLEY_DB = os.path.join(OUTPUT_FOLDER, 'foley_library.json')
+COMPOSE_HISTORY = os.path.join(OUTPUT_FOLDER, 'compose_history.json')
 
 for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER, SLICES_FOLDER]:
     os.makedirs(folder, exist_ok=True)
+os.makedirs(FOLEY_FOLDER, exist_ok=True)
 
 # ==================== key functions ====================
 
@@ -317,6 +324,351 @@ def get_slice(filename):
         return send_file(filepath, mimetype='audio/wav')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/upload-foley', methods=['POST'])
+def upload_foley():
+    """Upload a custom foley sample into the server library"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file provided'}), 400
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'success': False, 'error': 'Empty filename'}), 400
+
+        filename = secure_filename(file.filename)
+        dest = os.path.join(FOLEY_FOLDER, filename)
+        file.save(dest)
+
+        # analyze basic features for search/filtering and slice the uploaded foley
+        try:
+            # create per-foley slice folder
+            base = Path(filename).stem
+            foley_slice_dir = os.path.join(FOLEY_FOLDER, f"{base}_slices")
+            os.makedirs(foley_slice_dir, exist_ok=True)
+
+            # use soundExtracting.process_file to create slices and features
+            slice_paths, slice_features = soundExtracting.process_file(dest, foley_slice_dir, method='silence', analyze=True)
+            features = {
+                'slice_count': len(slice_paths),
+                'slices': [
+                    {
+                        'path': p,
+                        'features': f
+                    } for p, f in zip(slice_paths, slice_features)
+                ]
+            }
+        except Exception:
+            try:
+                y, sr = load_audio(dest)
+                features = analyze_slice_features(y, sr)
+            except Exception:
+                features = {}
+
+        # persist metadata
+        db = []
+        try:
+            if os.path.exists(FOLEY_DB):
+                with open(FOLEY_DB, 'r', encoding='utf-8') as f:
+                    db = json.load(f)
+        except Exception:
+            db = []
+
+        entry = {
+            'filename': filename,
+            'path': dest,
+            'features': features,
+            'slices_dir': os.path.join(FOLEY_FOLDER, f"{Path(filename).stem}_slices") if features and features.get('slice_count',0)>0 else None
+        }
+        db.append(entry)
+        with open(FOLEY_DB, 'w', encoding='utf-8') as f:
+            json.dump(db, f, indent=2)
+
+        return jsonify({'success': True, 'entry': entry})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/foley-library', methods=['GET'])
+def foley_library():
+    try:
+        db = []
+        if os.path.exists(FOLEY_DB):
+            with open(FOLEY_DB, 'r', encoding='utf-8') as f:
+                db = json.load(f)
+
+        # augment entries with slice listing if available
+        for entry in db:
+            slices_dir = entry.get('slices_dir')
+            entry['slices'] = []
+            if slices_dir and os.path.exists(slices_dir):
+                files = sorted([f for f in os.listdir(slices_dir) if f.lower().endswith('.wav')])
+                for fn in files:
+                    entry['slices'].append({'filename': fn, 'path': os.path.join(slices_dir, fn)})
+
+        # if db empty, auto-scan FOLEY_FOLDER
+        if not db:
+            files = [f for f in os.listdir(FOLEY_FOLDER) if f.lower().endswith(('.wav', '.mp3', '.flac', '.m4a', '.ogg'))]
+            for fn in files:
+                db.append({'filename': fn, 'path': os.path.join(FOLEY_FOLDER, fn), 'features': {}, 'slices': []})
+        return jsonify({'success': True, 'library': db})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/compose-history', methods=['GET'])
+def compose_history():
+    try:
+        history = []
+        if os.path.exists(COMPOSE_HISTORY):
+            with open(COMPOSE_HISTORY, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+        return jsonify({'success': True, 'history': history})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/compose', methods=['POST'])
+def compose_with_foley():
+    """Compose original audio with selected foley samples inserted at detected slice positions.
+    Expected JSON payload:
+      {
+        'filename': '<original uploaded filename>',
+        'slices': [ ... ]  # analysisData.slices from analyze-and-slice
+        'mappings': [ { 'slice_index': 0, 'foley_filename': 'kick.wav', 'gain': 1.0 }, ... ]
+      }
+    Returns: generated mixed audio path
+    """
+    try:
+        data = request.json
+        filename = data.get('filename')
+        slices = data.get('slices', [])
+        mappings = data.get('mappings', [])
+
+        if not filename or not slices or not mappings:
+            return jsonify({'success': False, 'error': 'filename, slices and mappings are required'}), 400
+
+        upload_path = os.path.join(UPLOAD_FOLDER, filename)
+        if not os.path.exists(upload_path):
+            return jsonify({'success': False, 'error': 'Original file not found'}), 404
+
+        # if video, extract its audio first
+        if filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+            temp_audio = os.path.join(OUTPUT_FOLDER, 'temp_compose_audio.wav')
+            audio_path = extract_audio_from_video(upload_path, temp_audio)
+            if not audio_path:
+                return jsonify({'success': False, 'error': 'Audio extraction failed'}), 500
+            src_audio_path = audio_path
+        else:
+            src_audio_path = upload_path
+
+        y, sr = load_audio(src_audio_path)
+        out = y.copy()
+
+        # For each mapping, replace the entire slice region with the foley slice
+        for m in mappings:
+            idx = int(m.get('slice_index'))
+            foley_fn = m.get('foley_filename')
+            gain = float(m.get('gain', 1.0))
+            if idx < 0 or idx >= len(slices):
+                continue
+
+            slice_feat = slices[idx]['features']
+            start_time = float(slice_feat.get('start_time', 0.0))
+            end_time = float(slice_feat.get('end_time', start_time))
+            start_sample = int(start_time * sr)
+            end_sample = int(end_time * sr)
+            slice_len = end_sample - start_sample
+
+            # locate foley file (may be in subdir)
+            foley_path = None
+            candidate = os.path.join(FOLEY_FOLDER, foley_fn)
+            if os.path.exists(candidate):
+                foley_path = candidate
+            else:
+                # search recursively
+                for root, dirs, files in os.walk(FOLEY_FOLDER):
+                    if foley_fn in files:
+                        foley_path = os.path.join(root, foley_fn)
+                        break
+                    
+            if not foley_path or not os.path.exists(foley_path):
+                continue
+
+            fy, fsr = load_audio(foley_path, sr=sr)
+            # apply gain
+            fy = fy * gain
+
+            # ensure new segment matches slice length: trim or pad with silence
+            if len(fy) > slice_len:
+                new_seg = fy[:slice_len]
+            elif len(fy) < slice_len:
+                pad = slice_len - len(fy)
+                new_seg = np.pad(fy, (0, pad), mode='constant')
+            else:
+                new_seg = fy
+
+            # replace slice region with new segment
+            if end_sample > len(out):
+                # pad out if slice extends beyond original (shouldn't typically happen)
+                out = np.pad(out, (0, end_sample - len(out)), mode='constant')
+            out[start_sample:end_sample] = new_seg
+
+        # normalize final mix to avoid clipping
+        out = normalize_audio(out, peak=0.98)
+
+        composed_name = f"{Path(filename).stem}_composed.wav"
+        composed_path = os.path.join(OUTPUT_FOLDER, composed_name)
+        sf.write(composed_path, out, sr)
+
+        # cleanup temp audio
+        try:
+            if 'temp_compose_audio.wav' in src_audio_path and os.path.exists(src_audio_path):
+                os.remove(src_audio_path)
+        except:
+            pass
+
+        # record compose history (audit)
+        try:
+            history = []
+            if os.path.exists(COMPOSE_HISTORY):
+                with open(COMPOSE_HISTORY, 'r', encoding='utf-8') as hf:
+                    history = json.load(hf)
+        except Exception:
+            history = []
+
+        hist_entry = {
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'original_file': filename,
+            'composed_file': composed_name,
+            'composed_path': composed_path,
+            'mappings': mappings,
+            'duration_samples': int(len(out)),
+            'sr': int(sr)
+        }
+        history.insert(0, hist_entry)
+        try:
+            with open(COMPOSE_HISTORY, 'w', encoding='utf-8') as hf:
+                json.dump(history, hf, indent=2)
+        except Exception:
+            pass
+
+        return jsonify({'success': True, 'composed': composed_name, 'path': composed_path})
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/get-composed/<filename>')
+def get_composed(filename):
+    try:
+        filepath = os.path.join(OUTPUT_FOLDER, secure_filename(filename))
+        if not os.path.exists(filepath):
+            return jsonify({'error': 'File not found'}), 404
+        return send_file(filepath, mimetype='audio/wav')
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/get-foley/<path:fname>')
+def get_foley(fname):
+    """Serve original foley file or any file inside the foley slices directories"""
+    try:
+        # sanitize filename (we'll search within FOLEY_FOLDER)
+        target = None
+        # direct path check
+        direct = os.path.join(FOLEY_FOLDER, fname)
+        if os.path.exists(direct):
+            target = direct
+        else:
+            # search recursively for a file with matching basename
+            for root, dirs, files in os.walk(FOLEY_FOLDER):
+                for f in files:
+                    if f == os.path.basename(fname):
+                        candidate = os.path.join(root, f)
+                        target = candidate
+                        break
+                if target:
+                    break
+
+        if not target or not os.path.exists(target):
+            return jsonify({'error': 'File not found'}), 404
+
+        return send_file(target, mimetype='audio/wav')
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/delete-foley', methods=['POST'])
+def delete_foley():
+    """Delete a foley file and its derived slices from the library.
+    Expects JSON: { 'filename': 'name.wav' }
+    """
+    try:
+        data = request.json
+        if not data or 'filename' not in data:
+            return jsonify({'success': False, 'error': 'filename required'}), 400
+        filename = secure_filename(data['filename'])
+
+        # load DB
+        db = []
+        if os.path.exists(FOLEY_DB):
+            try:
+                with open(FOLEY_DB, 'r', encoding='utf-8') as f:
+                    db = json.load(f)
+            except Exception:
+                db = []
+
+        # find entry
+        entry = None
+        for e in db:
+            if e.get('filename') == filename:
+                entry = e
+                break
+
+        # attempt to remove files
+        removed = []
+        # remove main file from FOLEY_FOLDER
+        main_path = os.path.join(FOLEY_FOLDER, filename)
+        if os.path.exists(main_path):
+            try:
+                os.remove(main_path)
+                removed.append(main_path)
+            except Exception:
+                pass
+
+        # remove slices dir if present in entry
+        if entry and entry.get('slices_dir'):
+            sd = entry.get('slices_dir')
+            if os.path.exists(sd):
+                try:
+                    shutil.rmtree(sd)
+                    removed.append(sd)
+                except Exception:
+                    pass
+
+        # remove any matching slice files in FOLEY_FOLDER subdirs
+        for root, dirs, files in os.walk(FOLEY_FOLDER):
+            for f in files:
+                if f == filename or f.startswith(Path(filename).stem + '_slice'):
+                    try:
+                        p = os.path.join(root, f)
+                        os.remove(p)
+                        removed.append(p)
+                    except Exception:
+                        pass
+
+        # remove entry from db and write back
+        new_db = [e for e in db if e.get('filename') != filename]
+        try:
+            with open(FOLEY_DB, 'w', encoding='utf-8') as f:
+                json.dump(new_db, f, indent=2)
+        except Exception:
+            pass
+
+        return jsonify({'success': True, 'removed': removed})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/demo-files', methods=['GET'])
 def get_demo_files():

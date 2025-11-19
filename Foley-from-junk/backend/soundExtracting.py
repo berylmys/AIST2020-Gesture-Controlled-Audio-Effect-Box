@@ -46,14 +46,13 @@ def fade_in_out(y, sr, fade_ms=10):
 def detect_slices_by_silence(y, sr, top_db=30, min_duration=0.03, merge_threshold=0.02):
     # returns list of (start_sample, end_sample)
     intervals = librosa.effects.split(y, top_db=top_db)
-    # filter too short
+    # filter too short and merge with previous
     filtered = []
     min_len = int(min_duration * sr)
     merge_gap = int(merge_threshold * sr)
     for s, e in intervals:
         if e - s >= min_len:
             if filtered and s - filtered[-1][1] <= merge_gap:
-                # merge with previous
                 filtered[-1] = (filtered[-1][0], e)
             else:
                 filtered.append((s, e))
