@@ -1,0 +1,35 @@
+{
+  "video_path": "cooking.mp4",
+  "total_duration": 11.38,
+  "num_activity_types": 1,
+  "total_scenes": 3,
+  "activity_groups": {
+    "0": {
+      "description": "Rhythmic | High-freq | Weak",
+      "count": 3,
+      "scenes": [
+        {
+          "start": 0.0,
+          "end": 3.0,
+          "duration": 3.0,
+          "start_formatted": "00:00.000",
+          "end_formatted": "00:03.000"
+        },
+        {
+          "start": 3.0,
+          "end": 8.0,
+          "duration": 5.0,
+          "start_formatted": "00:03.000",
+          "end_formatted": "00:08.000"
+        },
+        {
+          "start": 8.0,
+          "end": 11.38,
+          "duration": 3.380000000000001,
+          "start_formatted": "00:08.000",
+          "end_formatted": "00:11.380"
+        }
+      ]
+    }
+  }
+}
