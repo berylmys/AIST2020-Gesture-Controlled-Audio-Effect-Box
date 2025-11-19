@@ -17,10 +17,10 @@ class AudioSeparator:
       print(f"loading audio files: {file_path}")
       print(f" sampling rate: {sr} Hz, duration: {len(audio)/sr:.2f} seconds")
 
-    def detect_event(self, audio: np/ndarray, sr: int) -> List[Tuple[float, float]]:
+    def detect_event(self, audio: np.ndarray, sr: int) -> List[Tuple[float, float]]:
       rms = librosa.feature.rms(y=audio, hop_length=self.hop_length)[0]
       rms = rms / np.max(rms)
-      times = librosa.frames_to_time(np.arrange(len(rms)),
+      times = librosa.frames_to_time(np.arange(len(rms)),
                                      sr=sr,
                                      hop_length=self.hop_length)
       
