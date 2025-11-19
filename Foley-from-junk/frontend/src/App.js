@@ -560,7 +560,7 @@ function App() {
         {analysisData && (
           <>
             {/* 摘要卡片 */}
-            {/* <section className="card">
+            <section className="card">
               <h2>📊 Analysis Results</h2>
               <div className="summary">
                 <div className="summary-card">
@@ -576,7 +576,7 @@ function App() {
                   <span className="value">{analysisData.num_clusters}</span>
                 </div>
               </div>
-            </section> */}
+            </section>
 
             {/* time editor */}
             <section className="card">
