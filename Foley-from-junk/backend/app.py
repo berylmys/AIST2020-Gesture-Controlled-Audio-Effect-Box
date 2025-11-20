@@ -103,7 +103,7 @@ def normalize_audio(y, peak=0.98):
     return (y / maxv) * peak
 
 def fade_in_out(y, sr, fade_ms=10):
-    """添加淡入淡出"""
+    """fade in and out"""
     n = len(y)
     fade_samples = int(sr * (fade_ms / 1000.0))
     if fade_samples <= 0:
@@ -134,7 +134,7 @@ def save_slice(y, sr, output_dir, base_name, idx, features):
         'features': features
     }
 
-# ==================== API 端点 ====================
+# ==================== API  ====================
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -176,8 +176,8 @@ def upload_file():
 @app.route('/api/analyze-and-slice', methods=['POST'])
 def analyze_and_slice():
     """
-    核心功能：分析并切片音频
-    支持：视频文件、音频文件、自定义参数
+    Analyze and slice files
+    Support: video files, audio files and customized para
     """
     try:
         data = request.json
@@ -198,7 +198,7 @@ def analyze_and_slice():
         print(f"Method: {method}, Min Duration: {min_duration}s")
         print(f"{'='*60}\n")
         
-        # 1. 提取音频（如果是视频）
+        # 1. extract audio files from video
         if filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
             print("Extracting audio from video...")
             temp_audio = os.path.join(OUTPUT_FOLDER, 'temp_extracted_audio.wav')
@@ -208,13 +208,13 @@ def analyze_and_slice():
         else:
             audio_path = filepath
         
-        # 2. 加载音频
+        # 2. load audio files
         print("Loading audio...")
         y, sr = load_audio(audio_path)
         duration = len(y) / sr
         print(f"Duration: {duration:.2f} seconds\n")
         
-        # 3. 检测切片
+        # 3. detect silces
         print(f"Detecting slices using {method} method...")
         if method == 'onset':
             intervals = detect_onset_slices(y, sr, min_duration=min_duration)
@@ -230,7 +230,7 @@ def analyze_and_slice():
                 'suggestion': 'Lower min_duration or sensitivity'
             }), 400
         
-        # 4. 处理每个切片
+        # 4. processing slices
         print("Processing slices...")
         slices_data = []
         base_name = Path(filename).stem
@@ -240,13 +240,13 @@ def analyze_and_slice():
             start_time = start / sr
             end_time = end / sr
             
-            # 分析特征
+            # analyze features
             features = analyze_slice_features(slice_audio, sr)
             features['start_time'] = start_time
             features['end_time'] = end_time
             features['duration'] = end_time - start_time
             
-            # 保存切片
+            # save slice
             slice_info = save_slice(
                 slice_audio, sr, SLICES_FOLDER, base_name, idx, features
             )
@@ -256,7 +256,7 @@ def analyze_and_slice():
             print(f"  Slice {idx+1}: {start_time:.2f}s - {end_time:.2f}s "
                   f"({features['duration']:.2f}s) [{features['type']}]")
         
-        # 5. 聚类相似的音效
+        # 5. effect clustering
         print("\nClustering similar sounds...")
         n_clusters = min(4, len(slices_data))
         
@@ -278,7 +278,7 @@ def analyze_and_slice():
             for s in slices_data:
                 s['cluster'] = 0
         
-        # 6. 组织结果
+        # 6. organzie results
         result = {
             'success': True,
             'original_file': filename,
@@ -293,14 +293,14 @@ def analyze_and_slice():
             }
         }
         
-        # 7. 保存结果
+        # 7. save results
         result_path = os.path.join(OUTPUT_FOLDER, f'{base_name}_analysis.json')
         with open(result_path, 'w') as f:
             json.dump(result, f, indent=2)
         
         print(f"\n✓ Analysis complete! Saved to {result_path}\n")
         
-        # 清理临时文件
+        # empty temporary files
         if 'temp_extracted_audio.wav' in audio_path:
             try:
                 os.remove(audio_path)
@@ -316,7 +316,7 @@ def analyze_and_slice():
 
 @app.route('/api/get-slice/<filename>')
 def get_slice(filename):
-    """获取音频切片文件"""
+    """get audio files"""
     try:
         filepath = os.path.join(SLICES_FOLDER, filename)
         if not os.path.exists(filepath):
@@ -672,7 +672,7 @@ def delete_foley():
 
 @app.route('/api/demo-files', methods=['GET'])
 def get_demo_files():
-    """获取演示文件列表"""
+    """get demo file list"""
     demo_files = [
         {'name': 'Knife on Glass', 'file': 'Knife_glass.wav'},
         {'name': 'Boiling Water', 'file': 'boilingWater.wav'},
