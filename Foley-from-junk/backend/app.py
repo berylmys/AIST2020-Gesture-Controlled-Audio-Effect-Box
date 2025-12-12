@@ -1,3 +1,10 @@
+"""
+Foley From Junk - Flask Backend Server
+Clean architecture with separated concerns:
+- soundExtracting.py: Audio processing library (loading, slicing, analysis, 8-class classification)
+- videoProcessing.py: Video processing library (audio extraction, video info)
+- app.py: Flask API server (HTTP endpoints, file management, business logic)
+"""
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -9,11 +16,13 @@ from pathlib import Path
 import numpy as np
 import librosa
 import soundfile as sf
-from moviepy.editor import VideoFileClip
 import shutil
 from sklearn.cluster import KMeans
-import soundExtracting
 from datetime import datetime
+
+# Import our custom libraries
+import soundExtracting
+import videoProcessing
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -30,90 +39,36 @@ for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER, SLICES_FOLDER]:
     os.makedirs(folder, exist_ok=True)
 os.makedirs(FOLEY_FOLDER, exist_ok=True)
 
-# ==================== key functions ====================
+# ==================== Audio Processing (using soundExtracting library) ====================
 
-def extract_audio_from_video(video_path, output_audio='temp_audio.wav'):
-    """extract audio from video"""
-    try:
-        video = VideoFileClip(video_path)
-        audio = video.audio
-        if audio is None:
-            raise ValueError("Video has no audio track")
-        audio.write_audiofile(output_audio, verbose=False, logger=None)
-        video.close()
-        return output_audio
-    except Exception as e:
-        print(f"Failed to extract audio: {e}")
-        return None
-
-def load_audio(path, sr=22050):
-    """load audio files"""
-    y, sr = librosa.load(path, sr=sr, mono=True)
-    return y, sr
+# Direct references to soundExtracting functions
+load_audio = soundExtracting.load_audio
+normalize_audio = soundExtracting.normalize_audio
+fade_in_out = soundExtracting.fade_in_out
 
 def detect_onset_slices(y, sr, hop_length=512, min_duration=0.02):
-    """use onset to slice"""
-    onsets = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop_length, backtrack=True)
-    frames = librosa.frames_to_samples(onsets, hop_length=hop_length)
-    frames = np.unique(np.concatenate(([0], frames, [len(y)])))
-    
-    min_len = int(min_duration * sr)
-    intervals = []
-    for i in range(len(frames)-1):
-        s, e = frames[i], frames[i+1]
-        if e - s >= min_len:
-            intervals.append((s, e))
-    return intervals
+    """Wrapper for soundExtracting.detect_onset_slices"""
+    return soundExtracting.detect_onset_slices(y, sr, hop_length=hop_length, min_duration=min_duration)
 
 def detect_silence_slices(y, sr, top_db=30, min_duration=0.03):
-    """use silence detection to slice"""
-    intervals = librosa.effects.split(y, top_db=top_db)
-    min_len = int(min_duration * sr)
-    filtered = []
-    for s, e in intervals:
-        if e - s >= min_len:
-            filtered.append((s, e))
-    return filtered
+    """Wrapper for soundExtracting.detect_slices_by_silence"""
+    return soundExtracting.detect_slices_by_silence(y, sr, top_db=top_db, min_duration=min_duration)
 
 def analyze_slice_features(y, sr):
-    """feature dict"""
-    features = {
-        'rms': float(np.mean(librosa.feature.rms(y=y))),
-        'zcr': float(np.mean(librosa.feature.zero_crossing_rate(y))),
-        'spectral_centroid': float(np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))),
-        'spectral_bandwidth': float(np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr))),
-        'onset_strength': float(np.mean(librosa.onset.onset_strength(y=y, sr=sr)))
-    }
+    """
+    Analyze audio slice features using soundExtracting library
+    Now includes 8-class sound type classification:
+    - impact, metallic, friction, liquid, burst, resonant, ambient, continuous
+    """
+    # Use soundExtracting's enhanced analyze_slice function
+    features = soundExtracting.analyze_slice(y, sr)
     
-    # simple categories
-    if features['onset_strength'] > 1.5:
-        features['type'] = 'impact'  # 打击音效
-    elif features['rms'] < 0.02:
-        features['type'] = 'ambient'  # 环境音
-    elif features['spectral_centroid'] > 3000:
-        features['type'] = 'high_freq'  # 高频音效
-    else:
-        features['type'] = 'continuous'  # 连续音效
+    # Add backwards compatibility mappings
+    features['spectral_centroid'] = features['spec_cent']
+    features['spectral_bandwidth'] = features.get('spec_bw', 0)
+    features['onset_strength'] = features.get('onset_strength', 0)
     
     return features
-
-def normalize_audio(y, peak=0.98):
-    """normalize"""
-    maxv = np.max(np.abs(y)) + 1e-9
-    return (y / maxv) * peak
-
-def fade_in_out(y, sr, fade_ms=10):
-    """添加淡入淡出"""
-    n = len(y)
-    fade_samples = int(sr * (fade_ms / 1000.0))
-    if fade_samples <= 0:
-        return y
-    win = np.ones(n)
-    fade_in = np.linspace(0.0, 1.0, fade_samples)
-    fade_out = np.linspace(1.0, 0.0, fade_samples)
-    win[:fade_samples] = fade_in
-    win[-fade_samples:] = fade_out
-    return y * win
 
 def save_slice(y, sr, output_dir, base_name, idx, features):
     """save slices"""
@@ -147,7 +102,7 @@ def health_check():
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
-    """load videos or audios"""
+    """Upload video or audio files"""
     try:
         if 'file' not in request.files:
             return jsonify({'success': False, 'error': 'No file provided'}), 400
@@ -160,7 +115,8 @@ def upload_file():
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
         
-        file_type = 'video' if filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')) else 'audio'
+        # Use videoProcessing library to determine file type
+        file_type = 'video' if videoProcessing.is_video_file(filepath) else 'audio'
         
         return jsonify({
             'success': True,
@@ -198,23 +154,23 @@ def analyze_and_slice():
         print(f"Method: {method}, Min Duration: {min_duration}s")
         print(f"{'='*60}\n")
         
-        # 1. 提取音频（如果是视频）
-        if filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+        # 1. Extract audio (use videoProcessing library for videos)
+        if videoProcessing.is_video_file(filepath):
             print("Extracting audio from video...")
             temp_audio = os.path.join(OUTPUT_FOLDER, 'temp_extracted_audio.wav')
-            audio_path = extract_audio_from_video(filepath, temp_audio)
+            audio_path = videoProcessing.extract_audio_from_video(filepath, temp_audio)
             if not audio_path:
                 return jsonify({'success': False, 'error': 'Audio extraction failed'}), 500
         else:
             audio_path = filepath
         
-        # 2. 加载音频
+        # 2. load audio
         print("Loading audio...")
         y, sr = load_audio(audio_path)
         duration = len(y) / sr
         print(f"Duration: {duration:.2f} seconds\n")
         
-        # 3. 检测切片
+        # 3. slice detection
         print(f"Detecting slices using {method} method...")
         if method == 'onset':
             intervals = detect_onset_slices(y, sr, min_duration=min_duration)
@@ -230,7 +186,7 @@ def analyze_and_slice():
                 'suggestion': 'Lower min_duration or sensitivity'
             }), 400
         
-        # 4. 处理每个切片
+        # 4. processing slices
         print("Processing slices...")
         slices_data = []
         base_name = Path(filename).stem
@@ -256,18 +212,173 @@ def analyze_and_slice():
             print(f"  Slice {idx+1}: {start_time:.2f}s - {end_time:.2f}s "
                   f"({features['duration']:.2f}s) [{features['type']}]")
         
-        # 5. 聚类相似的音效
+        # 5. Group by sound type (8 categories) instead of clustering
+        print("\nGrouping by sound type...")
+        
+        # Get unique sound types from all slices
+        sound_types = list(set(s['features'].get('type', 'unknown') for s in slices_data))
+        sound_types.sort()  # 保持顺序一致
+        
+        # Create mapping from type to cluster number
+        type_to_cluster = {stype: idx for idx, stype in enumerate(sound_types)}
+        
+        # Assign cluster based on sound type
+        for s in slices_data:
+            sound_type = s['features'].get('type', 'unknown')
+            s['cluster'] = type_to_cluster[sound_type]
+        
+        n_clusters = len(sound_types)
+        print(f"Found {n_clusters} distinct sound types: {', '.join(sound_types)}")
+        
+        # Count slices per type
+        type_counts = {}
+        for s in slices_data:
+            stype = s['features'].get('type', 'unknown')
+            type_counts[stype] = type_counts.get(stype, 0) + 1
+        
+        for stype, count in type_counts.items():
+            print(f"  - {stype}: {count} events")
+        
+        # 6. Generate timeline data for UI
+        print("\nGenerating timeline visualization...")
+        timeline_data = []
+        for s in slices_data:
+            timeline_data.append({
+                'start': s['features']['start_time'],
+                'end': s['features']['end_time'],
+                'duration': s['features']['duration'],
+                'cluster': s['cluster'],
+                'type': s['features'].get('type', 'unknown'),
+                'type_label': s['features'].get('type_label', 'Unknown')
+            })
+        
+        print(f"\n{'='*60}")
+        print(f"✅ Analysis Complete!")
+        print(f"Total slices: {len(slices_data)}")
+        print(f"Sound categories: {n_clusters}")
+        print(f"{'='*60}\n")
+        
+        return jsonify({
+            'success': True,
+            'num_slices': len(slices_data),
+            'num_clusters': n_clusters,
+            'duration': duration,
+            'slices': slices_data,
+            'timeline': timeline_data,
+            'sound_types': sound_types,
+            'type_counts': type_counts
+        })
+        
+    except Exception as e:
+        print("\n❌ Error during analysis:")
+        print(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+    """
+    核心功能：分析并切片音频
+    支持：视频文件、音频文件、自定义参数
+    """
+    try:
+        data = request.json
+        filename = data.get('filename')
+        method = data.get('method', 'onset')  # onset 或 silence
+        min_duration = data.get('min_duration', 0.02)
+        top_db = data.get('top_db', 30)
+        
+        if not filename:
+            return jsonify({'success': False, 'error': 'No filename provided'}), 400
+        
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        if not os.path.exists(filepath):
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+        
+        print(f"\n{'='*60}")
+        print(f"Processing: {filename}")
+        print(f"Method: {method}, Min Duration: {min_duration}s")
+        print(f"{'='*60}\n")
+        
+        # 1. Extract audio (use videoProcessing library for videos)
+        if videoProcessing.is_video_file(filepath):
+            print("Extracting audio from video...")
+            temp_audio = os.path.join(OUTPUT_FOLDER, 'temp_extracted_audio.wav')
+            audio_path = videoProcessing.extract_audio_from_video(filepath, temp_audio)
+            if not audio_path:
+                return jsonify({'success': False, 'error': 'Audio extraction failed'}), 500
+        else:
+            audio_path = filepath
+        
+        # 2. load audio
+        print("Loading audio...")
+        y, sr = load_audio(audio_path)
+        duration = len(y) / sr
+        print(f"Duration: {duration:.2f} seconds\n")
+        
+        # 3. slice detection
+        print(f"Detecting slices using {method} method...")
+        if method == 'onset':
+            intervals = detect_onset_slices(y, sr, min_duration=min_duration)
+        else:
+            intervals = detect_silence_slices(y, sr, top_db=top_db, min_duration=min_duration)
+        
+        print(f"Found {len(intervals)} slices\n")
+        
+        if len(intervals) == 0:
+            return jsonify({
+                'success': False,
+                'error': 'No slices detected. Try adjusting parameters.',
+                'suggestion': 'Lower min_duration or sensitivity'
+            }), 400
+        
+        # 4. processing slices
+        print("Processing slices...")
+        slices_data = []
+        base_name = Path(filename).stem
+        
+        for idx, (start, end) in enumerate(intervals):
+            slice_audio = y[start:end]
+            start_time = start / sr
+            end_time = end / sr
+            
+            # 分析特征
+            features = analyze_slice_features(slice_audio, sr)
+            features['start_time'] = start_time
+            features['end_time'] = end_time
+            features['duration'] = end_time - start_time
+            
+            # 保存切片
+            slice_info = save_slice(
+                slice_audio, sr, SLICES_FOLDER, base_name, idx, features
+            )
+            
+            slices_data.append(slice_info)
+            
+            print(f"  Slice {idx+1}: {start_time:.2f}s - {end_time:.2f}s "
+                  f"({features['duration']:.2f}s) [{features['type']}]")
+        
+        # 5. Cluster similar sounds using comprehensive features
         print("\nClustering similar sounds...")
+
+        sound_types = list(set(s['features'].get('type', 'unknown') for s in slices_data))
+        sound_types.sort()
         n_clusters = min(4, len(slices_data))
         
         if n_clusters > 1:
+            # Use comprehensive feature set for better clustering
             X = np.array([[
-                s['features']['rms'],
-                s['features']['zcr'],
-                s['features']['spectral_centroid'],
-                s['features']['onset_strength']
+                s['features'].get('rms', 0),
+                s['features'].get('zcr', 0),
+                s['features'].get('spectral_centroid', 0),
+                s['features'].get('spectral_bandwidth', 0),
+                s['features'].get('onset_strength', 0),
+                s['features'].get('duration', 0),
+                s['features'].get('spec_rolloff', 0),
+                s['features'].get('spec_flatness', 0)
             ] for s in slices_data])
             
+            # Normalize features for better clustering
             X_normalized = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             labels = kmeans.fit_predict(X_normalized)
@@ -452,10 +563,10 @@ def compose_with_foley():
         if not os.path.exists(upload_path):
             return jsonify({'success': False, 'error': 'Original file not found'}), 404
 
-        # if video, extract its audio first
-        if filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+        # If video, extract its audio first (use videoProcessing library)
+        if videoProcessing.is_video_file(upload_path):
             temp_audio = os.path.join(OUTPUT_FOLDER, 'temp_compose_audio.wav')
-            audio_path = extract_audio_from_video(upload_path, temp_audio)
+            audio_path = videoProcessing.extract_audio_from_video(upload_path, temp_audio)
             if not audio_path:
                 return jsonify({'success': False, 'error': 'Audio extraction failed'}), 500
             src_audio_path = audio_path

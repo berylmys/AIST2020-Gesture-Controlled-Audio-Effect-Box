@@ -84,7 +84,30 @@ function App() {
       const data = await response.json();
       
       if (data.success) {
-        setAnalysisData(data);
+        // 验证并修复数据，确保所有必要字段都存在
+        const validatedSlices = data.slices.map(slice => ({
+          ...slice,
+          features: {
+            duration: slice.features?.duration || 0,
+            rms: slice.features?.rms || 0,
+            spectral_centroid: slice.features?.spectral_centroid || 0,
+            onset_strength: slice.features?.onset_strength || 0,
+            start_time: slice.features?.start_time || 0,
+            end_time: slice.features?.end_time || 0,
+            type: slice.features?.type || 'unknown',
+            type_label: slice.features?.type_label || 'Unknown',
+            zcr: slice.features?.zcr || 0,
+            spec_cent: slice.features?.spec_cent || 0,
+            spec_bw: slice.features?.spec_bw || 0,
+            ...slice.features
+          },
+          cluster: slice.cluster ?? 0
+        }));
+        
+        setAnalysisData({
+          ...data,
+          slices: validatedSlices
+        });
         setMessage(`✨ Found ${data.num_slices} sound events in ${data.num_clusters} categories!`);
       } else {
         setMessage(`❌ ${data.error}. ${data.suggestion || ''}`);
@@ -170,8 +193,12 @@ function App() {
   const getSoundTypeLabel = (type) => {
     const labels = {
       'impact': '🥁 Impact',
+      'metallic': '🔔 Metallic',
+      'friction': '✋ Friction',
+      'liquid': '💧 Liquid',
+      'burst': '💥 Burst',
+      'resonant': '🎵 Resonant',
       'ambient': '🌊 Ambient',
-      'high_freq': '🔔 High Freq',
       'continuous': '➰ Continuous'
     };
     return labels[type] || type;
@@ -185,479 +212,378 @@ function App() {
 
   const downloadJSON = () => {
     if (!analysisData) return;
-    const blob = new Blob([JSON.stringify(analysisData, null, 2)], {
-      type: 'application/json'
-    });
-    const url = URL.createObjectURL(blob);
+    const dataStr = JSON.stringify(analysisData, null, 2);
+    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+    const url = URL.createObjectURL(dataBlob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `${filename}_foley_data.json`;
+    link.download = `${filename}_analysis.json`;
     link.click();
     URL.revokeObjectURL(url);
   };
 
+  useEffect(() => {
+    if (file && fileType === 'video') {
+      const url = URL.createObjectURL(file);
+      setMediaUrl(url);
+      return () => URL.revokeObjectURL(url);
+    } else if (file && fileType !== 'video') {
+      const url = URL.createObjectURL(file);
+      setMediaUrl(url);
+      return () => URL.revokeObjectURL(url);
+    }
+  }, [file, fileType]);
+
   const fetchFoleyLibrary = async () => {
     try {
-      const res = await fetch('http://localhost:5001/api/foley-library');
-      const data = await res.json();
-      if (data.success) {
-        setFoleyLibrary(data.library);
-      }
-    } catch (e) {
-      console.error('Failed to fetch foley library', e);
-    }
-  };
-
-  const handleDeleteFoley = async (fname) => {
-    if (!window.confirm(`Delete foley '${fname}' and its derived slices? This cannot be undone.`)) return;
-    try {
-      const res = await fetch('http://localhost:5001/api/delete-foley', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: fname })
-      });
-      const data = await res.json();
-      if (data.success) {
-        setMessage('🗑️ Foley deleted');
-        fetchFoleyLibrary();
-        fetchComposeHistory();
-      } else {
-        setMessage('❌ Delete failed: ' + (data.error || ''));
-      }
+      const r = await fetch('http://localhost:5001/api/foley-library');
+      const data = await r.json();
+      setFoleyLibrary(data.library || []);
     } catch (err) {
-      setMessage('❌ Delete failed: ' + err.message);
-    }
-  };
-
-  const insertFoleyToSliceDirect = (fname) => {
-    if (selectedSlice == null) {
-      setMessage('⚠️  Select a slice in the timeline/list first');
-      return;
-    }
-    const exists = mappings.find(m => m.slice_index === selectedSlice);
-    let next = [...mappings];
-    if (exists) {
-      next = next.map(m => m.slice_index === selectedSlice ? { ...m, foley_filename: fname } : m);
-    } else {
-      next.push({ slice_index: selectedSlice, foley_filename: fname, gain: 1.0 });
-    }
-    setMappings(next);
-    setMessage(`➕ Inserted ${fname} into slice #${selectedSlice + 1}`);
-  };
-
-  const fetchComposeHistory = async () => {
-    try {
-      const res = await fetch('http://localhost:5001/api/compose-history');
-      const data = await res.json();
-      if (data.success) setComposeHistory(data.history);
-    } catch (e) {
-      console.error('Failed to fetch compose history', e);
+      console.error('Failed to fetch foley library', err);
     }
   };
 
   useEffect(() => {
     fetchFoleyLibrary();
-    fetchComposeHistory();
   }, []);
-
-  // cleanup composed object URL on unmount
-  useEffect(() => {
-    return () => {
-      try {
-        if (previousComposedRef.current) URL.revokeObjectURL(previousComposedRef.current);
-      } catch (e) {}
-    };
-  }, []);
-
-  const stopVideoWithComposed = () => {
-    try {
-      if (composedAudioRef.current) {
-        composedAudioRef.current.pause();
-        composedAudioRef.current.currentTime = 0;
-      }
-      if (videoRef.current) {
-        videoRef.current.pause();
-        videoRef.current.muted = false;
-      }
-      // if there is a stored cleanup, call it
-      try {
-        if (playingVideoComposedRef.current && playingVideoComposedRef.current.cleanup) {
-          playingVideoComposedRef.current.cleanup();
-        }
-      } catch (e) {}
-      playingVideoComposedRef.current = false;
-    } catch (e) {}
-  };
-
-  const playVideoWithComposed = async () => {
-    if (!composedUrl || !videoRef.current || !composedAudioRef.current) return;
-    try {
-      const v = videoRef.current;
-      const a = composedAudioRef.current;
-
-      // sync start time
-      a.currentTime = v.currentTime || 0;
-
-      // mute original video audio and play both
-      v.muted = true;
-      // ensure composed audio is unmuted
-      a.muted = false;
-
-      // when video pauses, pause composed audio; when video plays, resume composed audio
-      const onPlay = () => { try { if (a.paused) a.play(); } catch (e) {} };
-      const onPause = () => { try { if (!a.paused) a.pause(); } catch (e) {} };
-      const onEnded = () => { stopVideoWithComposed();
-      };
-
-      v.addEventListener('play', onPlay);
-      v.addEventListener('pause', onPause);
-      v.addEventListener('ended', onEnded);
-
-      // attach cleanup to composed audio end as well
-      const onAudioEnded = () => { stopVideoWithComposed(); };
-      a.addEventListener('ended', onAudioEnded);
-
-      // start playback
-      await Promise.all([v.play().catch(()=>{}), a.play().catch(()=>{})]);
-
-      playingVideoComposedRef.current = true;
-
-      // store cleanup on the ref so stop can remove listeners
-      playingVideoComposedRef.current = {
-        cleanup: () => {
-          try {
-            v.removeEventListener('play', onPlay);
-            v.removeEventListener('pause', onPause);
-            v.removeEventListener('ended', onEnded);
-            a.removeEventListener('ended', onAudioEnded);
-            v.muted = false;
-          } catch (e) {}
-        }
-      };
-    } catch (err) {
-      console.error('Failed to play video with composed audio', err);
-      stopVideoWithComposed();
-    }
-  };
 
   const handleFoleyUpload = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+    const foleyFile = e.target.files[0];
+    if (!foleyFile) return;
     setFoleyUploading(true);
     const fd = new FormData();
-    fd.append('file', file);
+    fd.append('file', foleyFile);
     try {
-      const res = await fetch('http://localhost:5001/api/upload-foley', {
+      const r = await fetch('http://localhost:5001/api/upload-foley', {
         method: 'POST',
         body: fd
       });
-      const data = await res.json();
+      const data = await r.json();
       if (data.success) {
+        setMessage(`✅ Foley uploaded: ${data.filename}`);
         fetchFoleyLibrary();
-        setMessage('✅ Foley uploaded to library');
       } else {
-        setMessage('❌ Foley upload failed: ' + (data.error || ''));
+        setMessage(`❌ Foley upload failed: ${data.error}`);
       }
     } catch (err) {
-      setMessage('❌ Foley upload failed: ' + err.message);
+      setMessage(`❌ Foley upload error: ${err.message}`);
     } finally {
       setFoleyUploading(false);
     }
   };
 
-  useEffect(() => {
-    // create object URL for uploaded file so preview players can use it
-    if (file) {
-      try {
-        const u = URL.createObjectURL(file);
-        setMediaUrl(u);
-        return () => {
-          try { URL.revokeObjectURL(u); } catch (e) {}
-          setMediaUrl(null);
-        };
-      } catch (e) {
-        console.error('Failed to create media URL', e);
-      }
-    } else {
-      setMediaUrl(null);
-    }
-  }, [file]);
-
   const insertFoleyToSlice = () => {
-    if (selectedSlice == null || !selectedFoleyForSlice) return;
-    const exists = mappings.find(m => m.slice_index === selectedSlice);
-    let next = [...mappings];
-    if (exists) {
-      next = next.map(m => m.slice_index === selectedSlice ? { ...m, foley_filename: selectedFoleyForSlice } : m);
+    if (selectedSlice === null || !selectedFoleyForSlice) return;
+    const existing = mappings.find(m => m.slice_index === selectedSlice);
+    if (existing) {
+      setMappings(prev => prev.map(m => m.slice_index === selectedSlice ? { ...m, foley_filename: selectedFoleyForSlice, gain: 1.0 } : m));
     } else {
-      next.push({ slice_index: selectedSlice, foley_filename: selectedFoleyForSlice, gain: 1.0 });
+      setMappings(prev => [...prev, { slice_index: selectedSlice, foley_filename: selectedFoleyForSlice, gain: 1.0 }]);
     }
-    setMappings(next);
-    setMessage('➕ Foley assigned to slice');
+    setMessage(`✅ Mapped slice #${selectedSlice + 1} to ${selectedFoleyForSlice}`);
+  };
+
+  const insertFoleyToSliceDirect = (foleyFilename) => {
+    if (selectedSlice === null) return;
+    const existing = mappings.find(m => m.slice_index === selectedSlice);
+    if (existing) {
+      setMappings(prev => prev.map(m => m.slice_index === selectedSlice ? { ...m, foley_filename: foleyFilename, gain: 1.0 } : m));
+    } else {
+      setMappings(prev => [...prev, { slice_index: selectedSlice, foley_filename: foleyFilename, gain: 1.0 }]);
+    }
+    setMessage(`✅ Mapped slice #${selectedSlice + 1} to ${foleyFilename}`);
   };
 
   const handleCompose = async () => {
-    if (!analysisData || mappings.length === 0) {
-      setMessage('Select at least one mapping before composing');
-      return;
-    }
+    if (!filename || mappings.length === 0) return;
     setComposing(true);
-    setMessage('🔧 Composing audio with foley...');
+    setMessage('🎚️ Composing new audio...');
     try {
-      const res = await fetch('http://localhost:5001/api/compose', {
+      const r = await fetch('http://localhost:5001/api/compose', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename, slices: analysisData.slices, mappings })
+        body: JSON.stringify({ filename, mappings })
       });
-      const data = await res.json();
+      const data = await r.json();
       if (data.success) {
-        setMessage('✅ Compose complete');
-        // fetch composed blob
-        const r2 = await fetch(`http://localhost:5001/api/get-composed/${data.composed}`);
-        const blob = await r2.blob();
-        const url = URL.createObjectURL(blob);
-        // revoke previous composed URL if present
-        try {
-          if (previousComposedRef.current) URL.revokeObjectURL(previousComposedRef.current);
-        } catch (e) {}
-        previousComposedRef.current = url;
-        setComposedUrl(url);
+        const cUrl = `http://localhost:5001/api/get-composed/${data.composed}?t=${Date.now()}`;
+        setComposedUrl(cUrl);
+        setMessage(`✅ Composed: ${data.composed}`);
+        fetchComposeHistory();
       } else {
-        setMessage('❌ Compose failed: ' + (data.error || ''));
+        setMessage(`❌ Compose failed: ${data.error}`);
       }
     } catch (err) {
-      setMessage('❌ Compose failed: ' + err.message);
+      setMessage(`❌ Compose error: ${err.message}`);
     } finally {
       setComposing(false);
     }
   };
 
-  // composed output is playable via the embedded player (`composedAudioRef`)
+  const fetchComposeHistory = async () => {
+    try {
+      const r = await fetch('http://localhost:5001/api/compose-history');
+      const data = await r.json();
+      setComposeHistory(data.history || []);
+    } catch (err) {
+      console.error('Failed to fetch compose history', err);
+    }
+  };
+
+  useEffect(() => {
+    fetchComposeHistory();
+  }, []);
+
+  const playVideoWithComposed = () => {
+    if (!videoRef.current || !composedAudioRef.current) return;
+    const v = videoRef.current;
+    const a = composedAudioRef.current;
+    v.muted = true;
+    v.currentTime = 0;
+    a.currentTime = 0;
+    v.play();
+    a.play();
+    playingVideoComposedRef.current = true;
+    const syncInterval = setInterval(() => {
+      if (!playingVideoComposedRef.current) {
+        clearInterval(syncInterval);
+        return;
+      }
+      if (Math.abs(v.currentTime - a.currentTime) > 0.3) {
+        a.currentTime = v.currentTime;
+      }
+    }, 100);
+    v.onended = () => {
+      a.pause();
+      playingVideoComposedRef.current = false;
+      clearInterval(syncInterval);
+    };
+    v.onpause = () => {
+      a.pause();
+    };
+  };
+
+  const stopVideoWithComposed = () => {
+    if (videoRef.current) videoRef.current.pause();
+    if (composedAudioRef.current) composedAudioRef.current.pause();
+    playingVideoComposedRef.current = false;
+  };
+
+  const handleDeleteFoley = async (foleyFilename) => {
+    if (!window.confirm(`Delete ${foleyFilename}?`)) return;
+    try {
+      const r = await fetch('http://localhost:5001/api/delete-foley', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: foleyFilename })
+      });
+      const data = await r.json();
+      if (data.success) {
+        setMessage(`✅ Deleted: ${foleyFilename}`);
+        fetchFoleyLibrary();
+      } else {
+        setMessage(`❌ Delete failed: ${data.error}`);
+      }
+    } catch (err) {
+      setMessage(`❌ Delete error: ${err.message}`);
+    }
+  };
 
   return (
     <div className="App">
       <header>
-        <h1>🎵 Foley from Junk</h1>
-        <p>Smart Audio Slicing & Foley Detection</p>
+        <h1>🎵 FOLEY FROM JUNK</h1>
+        <p>AI-Powered Foley Sound Extraction & Replacement System</p>
       </header>
 
       <main>
-        {/* 上传区域 */}
-        <section className="card">
-          <h2>📁 Upload File</h2>
-          <label className="upload-box" htmlFor="file-upload">
-            <span className="upload-text">
-              {file ? `📄 ${file.name}` : '📤 Choose video or audio file'}
-            </span>
-            <span className="upload-hint">
-              {file ? `Type: ${fileType}` : 'MP4, AVI, MOV, WAV, MP3...'}
-            </span>
-          </label>
-          <input
-            id="file-upload"
-            type="file"
-            accept="video/*,audio/*"
-            onChange={handleFileUpload}
-            disabled={uploading}
-            style={{ display: 'none' }}
-          />
-          {uploading && <p className="status">Uploading...</p>}
-          {mediaUrl && (
+        {!analysisData ? (
+          <>
             <section className="card">
-              <h2>▶️ Player Preview</h2>
-              {fileType === 'video' ? (
-                <video
-                  ref={videoRef}
-                  src={mediaUrl}
-                  controls
-                  style={{ width: '100%', maxHeight: '420px', background: '#000' }}
-                />
-              ) : (
-                <audio ref={audioRef} src={mediaUrl} controls style={{ width: '100%' }} />
-              )}
-              <div style={{ marginTop: '8px', color: 'var(--text-dim)' }}>
-                Tip: Click timeline events to seek the player and preview mapped foley.
-              </div>
-            </section>
-          )}
-        </section>
-
-        {/* 参数设置 */}
-        {filename && !analysisData && (
-          <section className="card">
-            <h2>⚙️ Detection Settings</h2>
-            <div className="settings">
-              <label>
-                <strong>Detection Method:</strong>
-                <select
-                  value={method}
-                  onChange={(e) => setMethod(e.target.value)}
-                  style={{
-                    padding: '10px',
-                    borderRadius: '8px',
-                    border: '2px solid rgba(0, 217, 255, 0.3)',
-                    background: 'rgba(0, 217, 255, 0.05)',
-                    color: 'var(--primary)',
-                    fontSize: '1em'
-                  }}
-                >
-                  <option value="onset">Onset Detection (Best for impacts)</option>
-                  <option value="silence">Silence Detection (Best for pauses)</option>
-                </select>
-              </label>
-              
-              <label>
-                <strong>Minimum Duration (seconds):</strong>
-                <input
-                  type="number"
-                  min="0.01"
-                  max="1"
-                  step="0.01"
-                  value={minDuration}
-                  onChange={(e) => setMinDuration(parseFloat(e.target.value))}
-                />
-                <span style={{ fontSize: '0.85em', color: 'var(--text-dim)' }}>
-                  Smaller = more sensitive, captures shorter sounds
+              <h2>📁 Upload Media</h2>
+              <label className="upload-box" htmlFor="file-upload">
+                <span className="upload-text">
+                  {uploading ? '⏳ Uploading...' : '📤 Click to Upload'}
+                </span>
+                <span className="upload-hint">
+                  Supports: Video (MP4, MOV, AVI) or Audio (WAV, MP3, FLAC)
                 </span>
               </label>
+              <input
+                id="file-upload"
+                type="file"
+                accept="video/*,audio/*"
+                onChange={handleFileUpload}
+                style={{ display: 'none' }}
+                disabled={uploading}
+              />
 
-              {method === 'silence' && (
-                <label>
-                  <strong>Silence Threshold (dB):</strong>
-                  <input
-                    type="number"
-                    min="10"
-                    max="60"
-                    step="5"
-                    value={topDb}
-                    onChange={(e) => setTopDb(parseInt(e.target.value))}
-                  />
-                  <span style={{ fontSize: '0.85em', color: 'var(--text-dim)' }}>
-                    Lower = more sensitive to quiet sounds
-                  </span>
-                </label>
+              {filename && (
+                <div style={{ marginTop: '20px', padding: '15px', background: 'rgba(0,217,255,0.1)', borderRadius: '8px' }}>
+                  <strong>📄 File:</strong> {filename}<br />
+                  <strong>📊 Type:</strong> {fileType}
+                </div>
               )}
-            </div>
-            
-            <button
-              onClick={handleAnalyze}
-              disabled={analyzing}
-              className="btn-primary"
-            >
-              {analyzing ? '🔍 Analyzing...' : '🚀 Start Analysis'}
-            </button>
-          </section>
-        )}
-
-        {/* 消息提示 */}
-        {message && (
-          <div className={`message ${message.includes('❌') ? 'error' : 'success'}`}>
-            {message}
-          </div>
-        )}
-
-        {/* 分析结果 - 时间轴视图 */}
-        {analysisData && (
-          <>
-            {/* 摘要卡片 */}
-            <section className="card">
-              <h2>📊 Analysis Results</h2>
-              <div className="summary">
-                <div className="summary-card">
-                  <span className="label">Total Duration</span>
-                  <span className="value">{analysisData.total_duration.toFixed(1)}s</span>
-                </div>
-                <div className="summary-card">
-                  <span className="label">Sound Events</span>
-                  <span className="value">{analysisData.num_slices}</span>
-                </div>
-                <div className="summary-card">
-                  <span className="label">Categories</span>
-                  <span className="value">{analysisData.num_clusters}</span>
-                </div>
-              </div>
             </section>
 
-            {/* time editor */}
+            {filename && (
+              <section className="card">
+                <h2>⚙️ Analysis Settings</h2>
+                <div className="settings">
+                  <label>
+                    <strong>Detection Method:</strong>
+                    <select value={method} onChange={(e) => setMethod(e.target.value)}>
+                      <option value="onset">Onset Detection (Recommended)</option>
+                      <option value="silence">Silence Detection</option>
+                    </select>
+                  </label>
+
+                  <label>
+                    <strong>Minimum Duration (seconds):</strong>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={minDuration}
+                      onChange={(e) => setMinDuration(parseFloat(e.target.value))}
+                    />
+                  </label>
+
+                  {method === 'silence' && (
+                    <label>
+                      <strong>Silence Threshold (dB):</strong>
+                      <input
+                        type="number"
+                        value={topDb}
+                        onChange={(e) => setTopDb(parseInt(e.target.value))}
+                      />
+                    </label>
+                  )}
+                </div>
+
+                <button
+                  className="btn-primary"
+                  onClick={handleAnalyze}
+                  disabled={analyzing}
+                  style={{ width: '100%', marginTop: '20px' }}
+                >
+                  {analyzing ? '🔍 Analyzing...' : '🚀 Analyze & Slice Audio'}
+                </button>
+              </section>
+            )}
+          </>
+        ) : (
+          <>
+            {/* Summary Cards */}
+            <div className="summary">
+              <div className="summary-card">
+                <div className="label">Total Duration</div>
+                <div className="value">{analysisData.duration.toFixed(1)}s</div>
+              </div>
+              <div className="summary-card">
+                <div className="label">Sound Events</div>
+                <div className="value">{analysisData.num_slices}</div>
+              </div>
+              <div className="summary-card">
+                <div className="label">Categories</div>
+                <div className="value">{analysisData.num_clusters}</div>
+              </div>
+            </div>
+
+            {/* Media Player */}
+            {file && (
+              <section className="card">
+                <h2>🎬 Media Player</h2>
+                {fileType === 'video' ? (
+                  <video
+                    ref={videoRef}
+                    src={mediaUrl}
+                    controls
+                    style={{ width: '100%', borderRadius: '8px' }}
+                  />
+                ) : (
+                  <audio
+                    ref={audioRef}
+                    src={mediaUrl}
+                    controls
+                    style={{ width: '100%' }}
+                  />
+                )}
+              </section>
+            )}
+
+            {/* Timeline Editor */}
             <section className="card">
-              <h2>🎬 Timeline Editor</h2>
+              <h2>🎬 TIMELINE EDITOR</h2>
               <p style={{ color: 'var(--text-dim)', marginBottom: '20px' }}>
                 Click on any sound event to preview. Different colors represent different sound categories.
               </p>
-
-              {/* time axis tracker */}
+              
               <div className="timeline-container">
-                <div className="timeline-track" ref={waveformRef}>
-                  {analysisData.slices.map((slice, idx) => {
-                    const startPercent = (slice.features.start_time / analysisData.total_duration) * 100;
-                    const widthPercent = (slice.features.duration / analysisData.total_duration) * 100;
+                <div className="timeline-track">
+                  {analysisData.timeline.map((seg, idx) => {
+                    const totalDuration = analysisData.duration;
+                    const left = (seg.start / totalDuration) * 100;
+                    const width = ((seg.end - seg.start) / totalDuration) * 100;
                     const isSelected = selectedSlice === idx;
-                    const isPlaying = playingSlice?.filename === slice.filename;
+                    const isPlaying = playingSlice === analysisData.slices[idx];
 
-                    const mapped = mappings.find(m => m.slice_index === idx);
                     return (
                       <div
                         key={idx}
                         className={`timeline-segment ${isSelected ? 'selected' : ''} ${isPlaying ? 'playing' : ''}`}
                         style={{
-                          left: `${startPercent}%`,
-                          width: `${Math.max(widthPercent, 0.5)}%`,
-                          backgroundColor: getClusterColor(slice.cluster),
-                          border: mapped ? '3px solid #ffd166' : (isSelected ? '2px solid white' : 'none'),
-                          opacity: isPlaying ? 1 : 0.85,
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center'
+                          left: `${left}%`,
+                          width: `${width}%`,
+                          background: getClusterColor(seg.cluster)
                         }}
                         onClick={() => {
                           setSelectedSlice(idx);
-                          previewSlice(slice);
+                          previewSlice(analysisData.slices[idx]);
                         }}
-                        title={`${formatTime(slice.features.start_time)} - ${getSoundTypeLabel(slice.features.type)}`}
                       >
-                        {mapped && (
-                          <span style={{ fontSize: '0.75em', background: 'rgba(0,0,0,0.2)', padding: '2px 6px', borderRadius: '6px' }}>{mapped.foley_filename}</span>
-                        )}
-                        {widthPercent > 2 && !mapped && (
-                          <span style={{ fontSize: '0.7em' }}>{slice.features.duration.toFixed(2)}s</span>
-                        )}
+                        {seg.duration.toFixed(2)}s
                       </div>
                     );
                   })}
                 </div>
 
-                {/* timestample */}
                 <div className="time-markers">
-                  {[0, 0.25, 0.5, 0.75, 1].map(f => (
-                    <span key={f} style={{ left: `${f * 100}%` }}>
-                      {formatTime(analysisData.total_duration * f)}
+                  {[0, 0.25, 0.5, 0.75, 1].map((ratio) => (
+                    <span key={ratio} style={{ left: `${ratio * 100}%` }}>
+                      {formatTime(analysisData.duration * ratio)}
                     </span>
                   ))}
                 </div>
-              </div>
 
-              {/* illustration */}
-              <div className="legend">
-                {Array.from(new Set(analysisData.slices.map(s => s.cluster))).map(cluster => {
-                  const slicesInCluster = analysisData.slices.filter(s => s.cluster === cluster);
-                  const avgType = slicesInCluster[0]?.features.type || 'unknown';
-                  
-                  return (
-                    <div key={cluster} className="legend-item">
-                      <span
-                        className="legend-color"
-                        style={{ backgroundColor: getClusterColor(cluster) }}
-                      />
-                      <span>
-                        Category {cluster + 1}: {getSoundTypeLabel(avgType)} ({slicesInCluster.length} events)
-                      </span>
-                    </div>
-                  );
-                })}
-                    {/* Resource Library */}
+                <div className="legend">
+                  {Array.from(new Set(analysisData.slices.map(s => s.cluster))).sort().map((cluster) => {
+                    const slicesInCluster = analysisData.slices.filter(s => s.cluster === cluster);
+                    const types = [...new Set(slicesInCluster.map(s => s.features.type))];
+                    return (
+                      <div key={cluster} className="legend-item">
+                        <div
+                          className="legend-color"
+                          style={{ background: getClusterColor(cluster) }}
+                        />
+                        <span>
+                          Category {cluster + 1}: {types.map(t => getSoundTypeLabel(t)).join(', ')} ({slicesInCluster.length} events)
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </section>
+
+            {/* Foley Resource Library & Compose History in two columns */}
+            <section className="card">
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '30px' }}>
+
+                    {/* Foley library */}
                     <section className="card">
                       <h2>📚 Foley Resource Library</h2>
-                      <p style={{ color: 'var(--text-dim)' }}>Uploaded foley samples and their derived slices.</p>
+                      <p style={{ color: 'var(--text-dim)' }}>Upload and manage your foley sound effects library.</p>
                       <div style={{ display: 'grid', gap: '10px' }}>
                         {foleyLibrary.map((f, i) => (
                           <div key={i} style={{ border: '1px solid rgba(0,0,0,0.06)', padding: '8px', borderRadius: '6px' }}>
@@ -731,18 +657,18 @@ function App() {
                   >
                     <div className="slice-info">
                       <span className="slice-number">#{idx + 1}</span>
-                      <span className="slice-type">{getSoundTypeLabel(slice.features.type)}</span>
+                      <span className="slice-type">{getSoundTypeLabel(slice.features?.type)}</span>
                       <span className="slice-time">
-                        {formatTime(slice.features.start_time)} → {formatTime(slice.features.end_time)}
+                        {formatTime(slice.features?.start_time || 0)} → {formatTime(slice.features?.end_time || 0)}
                       </span>
                       <span className="slice-duration">
-                        {slice.features.duration.toFixed(2)}s
+                        {(slice.features?.duration || 0).toFixed(2)}s
                       </span>
                     </div>
                     <div className="slice-features">
-                      <span>Energy: {(slice.features.rms * 100).toFixed(1)}%</span>
-                      <span>Freq: {slice.features.spectral_centroid.toFixed(0)} Hz</span>
-                      <span>Impact: {slice.features.onset_strength.toFixed(2)}</span>
+                      <span>Energy: {((slice.features?.rms || 0) * 100).toFixed(1)}%</span>
+                      <span>Freq: {(slice.features?.spectral_centroid || 0).toFixed(0)} Hz</span>
+                      <span>Impact: {(slice.features?.onset_strength || 0).toFixed(2)}</span>
                     </div>
                   </div>
                 ))}
@@ -835,6 +761,12 @@ function App() {
           </>
         )}
       </main>
+
+      {message && (
+        <div className={`message ${message.includes('✅') || message.includes('✨') ? 'success' : 'error'}`}>
+          {message}
+        </div>
+      )}
 
       <footer>
         💡 This tool automatically detects and categorizes sound events for foley replacement
