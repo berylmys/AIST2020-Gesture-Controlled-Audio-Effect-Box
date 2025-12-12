@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+*pyc
 
 # Python virtual environments
 venv/
@@ -36,3 +37,5 @@ Thumbs.db
 # Env files
 .env.local
 .env.*.local
+python10env/
+
