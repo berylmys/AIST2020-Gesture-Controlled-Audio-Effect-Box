@@ -3,7 +3,7 @@ Video Processing Library for Foley from Junk
 Handles video file operations including audio extraction
 """
 
-from moviepy.editor import VideoFileClip
+from moviepy.video.io.VideoFileClip import VideoFileClip
 import os
 from pathlib import Path
 
@@ -33,11 +33,8 @@ def extract_audio_from_video(video_path, output_audio='temp_audio.wav', verbose=
         
         # Extract audio
         audio = video.audio
-        audio.write_audiofile(
-            output_audio, 
-            verbose=verbose, 
-            logger=None if not verbose else 'bar'
-        )
+        # 新版 moviepy 不再支持 verbose 和 logger 参数
+        audio.write_audiofile(output_audio)
         
         video.close()
         return output_audio
@@ -141,7 +138,7 @@ def extract_audio_safe(video_path, output_audio='temp_audio.wav', verbose=False)
     if not is_valid:
         return False, message
     
-    # Extract
+    # Extract (verbose parameter is ignored in new moviepy)
     audio_path = extract_audio_from_video(video_path, output_audio, verbose)
     
     if audio_path and os.path.exists(audio_path):

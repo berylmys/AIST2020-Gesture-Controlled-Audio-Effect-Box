@@ -24,16 +24,20 @@ function App() {
   const previousComposedRef = useRef(null);
   const playingVideoComposedRef = useRef(false);
   
-  // para
+  // Analysis parameters
   const [method, setMethod] = useState('onset');
   const [minDuration, setMinDuration] = useState(0.02);
   const [topDb, setTopDb] = useState(30);
+  
+  // Foley 音效增强参数
+  const [foleyEnhance, setFoleyEnhance] = useState(true);  // 默认启用
   
   const audioRef = useRef(null);
   const waveformRef = useRef(null);
   const videoRef = useRef(null);
   const previewAudioRef = useRef(null);
 
+  // File upload handler
   const handleFileUpload = async (e) => {
     const uploadedFile = e.target.files[0];
     if (!uploadedFile) return;
@@ -56,6 +60,9 @@ function App() {
       setFile(uploadedFile);
       setMessage(`✅ ${data.file_type === 'video' ? 'Video' : 'Audio'} uploaded successfully!`);
       setAnalysisData(null);
+      setMappings([]);
+      setComposedUrl(null);
+      setSelectedSlice(null);
     } catch (error) {
       setMessage('❌ Upload failed: ' + error.message);
     } finally {
@@ -63,6 +70,7 @@ function App() {
     }
   };
 
+  // Analysis handler
   const handleAnalyze = async () => {
     if (!filename) return;
 
@@ -84,8 +92,18 @@ function App() {
       const data = await response.json();
       
       if (data.success) {
-        // 验证并修复数据，确保所有必要字段都存在
-        const validatedSlices = data.slices.map(slice => ({
+        // Build cluster map from clusters data
+        const clusterMap = {};
+        if (data.clusters) {
+          data.clusters.forEach(cluster => {
+            cluster.members.forEach(memberIndex => {
+              clusterMap[memberIndex] = cluster.cluster_id;
+            });
+          });
+        }
+        
+        // Validate and fix data, ensure all necessary fields exist
+        const validatedSlices = data.slices.map((slice, idx) => ({
           ...slice,
           features: {
             duration: slice.features?.duration || 0,
@@ -101,14 +119,17 @@ function App() {
             spec_bw: slice.features?.spec_bw || 0,
             ...slice.features
           },
-          cluster: slice.cluster ?? 0
+          cluster: clusterMap[idx] ?? slice.cluster ?? 0
         }));
         
         setAnalysisData({
           ...data,
-          slices: validatedSlices
+          slices: validatedSlices,
+          num_slices: data.stats?.total_slices || validatedSlices.length,
+          num_clusters: data.clusters?.length || 1,
+          duration: data.stats?.duration || 0
         });
-        setMessage(`✨ Found ${data.num_slices} sound events in ${data.num_clusters} categories!`);
+        setMessage(`✨ Found ${validatedSlices.length} sound events in ${data.clusters?.length || 1} categories!`);
       } else {
         setMessage(`❌ ${data.error}. ${data.suggestion || ''}`);
       }
@@ -119,6 +140,7 @@ function App() {
     }
   };
 
+  // Stop preview audio
   const stopPreview = () => {
     try {
       if (previewAudioRef.current) {
@@ -130,35 +152,46 @@ function App() {
       }
       if (videoRef.current) videoRef.current.muted = false;
       if (audioRef.current) audioRef.current.muted = false;
-    } catch (e) {}
+    } catch (e) {
+      console.error('Error stopping preview:', e);
+    }
   };
 
+  // Preview slice with foley mapping support
   const previewSlice = async (slice, options = { seekOnly: false }) => {
-    // Seek main media (video or audio) to slice start and play; if mapping exists, play foley slice instead (muting main audio)
     stopPreview();
     try {
       const start = slice.features.start_time;
-      const mapping = mappings.find(m => m.slice_index === (analysisData ? analysisData.slices.indexOf(slice) : -1));
+      const sliceIndex = analysisData ? analysisData.slices.indexOf(slice) : -1;
+      const mapping = mappings.find(m => m.slice_index === sliceIndex);
 
-      // seek and play main media
+      // Seek and play main media (video or audio)
       if (file && fileType === 'video' && videoRef.current) {
         const v = videoRef.current;
         v.currentTime = start;
-        // if we're previewing a foley, mute video audio
+        // Mute video audio if foley mapping exists
         if (mapping && mapping.foley_filename) {
           v.muted = true;
         } else {
           v.muted = false;
         }
-        v.play();
+        if (!options.seekOnly) {
+          v.play();
+        }
       } else if (file && fileType !== 'video' && audioRef.current) {
         const a = audioRef.current;
         a.currentTime = start;
-        if (mapping && mapping.foley_filename) a.muted = true; else a.muted = false;
-        a.play();
+        if (mapping && mapping.foley_filename) {
+          a.muted = true;
+        } else {
+          a.muted = false;
+        }
+        if (!options.seekOnly) {
+          a.play();
+        }
       }
 
-      // if there is a mapping and not seekOnly, play the mapped foley slice
+      // If there's a mapping and not seekOnly, play the mapped foley slice
       if (mapping && mapping.foley_filename && !options.seekOnly) {
         const fn = mapping.foley_filename;
         const r = await fetch(`http://localhost:5001/api/get-foley/${fn}`);
@@ -166,6 +199,7 @@ function App() {
         const url = URL.createObjectURL(blob);
         const pa = new Audio(url);
         previewAudioRef.current = pa;
+        pa.volume = mapping.gain || 1.0;
         pa.play();
         setPlayingSlice(slice);
         pa.onended = () => {
@@ -173,15 +207,17 @@ function App() {
           stopPreview();
         };
       } else {
-        // no mapping: just play main media for short period or until user stops
+        // No mapping: just play main media
         setPlayingSlice(slice);
       }
     } catch (err) {
-      console.error('Preview failed', err);
+      console.error('Preview failed:', err);
+      setMessage('❌ Preview failed: ' + err.message);
       stopPreview();
     }
   };
 
+  // Get cluster color (legacy - for backward compatibility)
   const getClusterColor = (cluster) => {
     const colors = [
       '#00d9ff', '#ff00ff', '#00ff88', '#ffcc00',
@@ -190,6 +226,22 @@ function App() {
     return colors[cluster % colors.length];
   };
 
+  // Get sound type color - 8 distinct colors for 8 sound categories
+  const getSoundTypeColor = (type) => {
+    const typeColors = {
+      'impact': '#FF6B6B',      // red - impact
+      'metallic': '#4ECDC4',    // cyan - metallic
+      'friction': '#95E1D3',    // mint - friction
+      'liquid': '#38A3A5',      // aqua - liquid
+      'burst': '#F38181',       // magenta - burst
+      'resonant': '#AA96DA',    // purple - resonant
+      'ambient': '#FCBAD3',     // pink - ambient
+      'continuous': '#FFFFD2'   // yellow - continuous 
+    };
+    return typeColors[type] || '#808080'; // 默认灰色
+  };
+
+  // Get sound type label with emoji
   const getSoundTypeLabel = (type) => {
     const labels = {
       'impact': '🥁 Impact',
@@ -204,12 +256,14 @@ function App() {
     return labels[type] || type;
   };
 
+  // Format time as M:SS.SSS
   const formatTime = (sec) => {
     const m = Math.floor(sec / 60);
     const s = (sec % 60).toFixed(3);
     return `${m}:${s.padStart(6, '0')}`;
   };
 
+  // Download analysis as JSON
   const downloadJSON = () => {
     if (!analysisData) return;
     const dataStr = JSON.stringify(analysisData, null, 2);
@@ -222,32 +276,32 @@ function App() {
     URL.revokeObjectURL(url);
   };
 
+  // Create media URL from uploaded file
   useEffect(() => {
-    if (file && fileType === 'video') {
-      const url = URL.createObjectURL(file);
-      setMediaUrl(url);
-      return () => URL.revokeObjectURL(url);
-    } else if (file && fileType !== 'video') {
+    if (file) {
       const url = URL.createObjectURL(file);
       setMediaUrl(url);
       return () => URL.revokeObjectURL(url);
     }
-  }, [file, fileType]);
+  }, [file]);
 
+  // Fetch foley library from server
   const fetchFoleyLibrary = async () => {
     try {
       const r = await fetch('http://localhost:5001/api/foley-library');
       const data = await r.json();
       setFoleyLibrary(data.library || []);
     } catch (err) {
-      console.error('Failed to fetch foley library', err);
+      console.error('Failed to fetch foley library:', err);
     }
   };
 
+  // Load foley library on mount
   useEffect(() => {
     fetchFoleyLibrary();
   }, []);
 
+  // Upload foley file
   const handleFoleyUpload = async (e) => {
     const foleyFile = e.target.files[0];
     if (!foleyFile) return;
@@ -273,30 +327,55 @@ function App() {
     }
   };
 
+  // Insert foley to selected slice (from dropdown)
   const insertFoleyToSlice = () => {
     if (selectedSlice === null || !selectedFoleyForSlice) return;
     const existing = mappings.find(m => m.slice_index === selectedSlice);
     if (existing) {
-      setMappings(prev => prev.map(m => m.slice_index === selectedSlice ? { ...m, foley_filename: selectedFoleyForSlice, gain: 1.0 } : m));
+      setMappings(prev => prev.map(m => 
+        m.slice_index === selectedSlice 
+          ? { ...m, foley_filename: selectedFoleyForSlice, gain: 1.0 } 
+          : m
+      ));
     } else {
-      setMappings(prev => [...prev, { slice_index: selectedSlice, foley_filename: selectedFoleyForSlice, gain: 1.0 }]);
+      setMappings(prev => [...prev, { 
+        slice_index: selectedSlice, 
+        foley_filename: selectedFoleyForSlice, 
+        gain: 1.0 
+      }]);
     }
     setMessage(`✅ Mapped slice #${selectedSlice + 1} to ${selectedFoleyForSlice}`);
   };
 
+  // Insert foley to selected slice (direct)
   const insertFoleyToSliceDirect = (foleyFilename) => {
-    if (selectedSlice === null) return;
+    if (selectedSlice === null) {
+      setMessage('⚠️ Please select a slice first');
+      return;
+    }
     const existing = mappings.find(m => m.slice_index === selectedSlice);
     if (existing) {
-      setMappings(prev => prev.map(m => m.slice_index === selectedSlice ? { ...m, foley_filename: foleyFilename, gain: 1.0 } : m));
+      setMappings(prev => prev.map(m => 
+        m.slice_index === selectedSlice 
+          ? { ...m, foley_filename: foleyFilename, gain: 1.0 } 
+          : m
+      ));
     } else {
-      setMappings(prev => [...prev, { slice_index: selectedSlice, foley_filename: foleyFilename, gain: 1.0 }]);
+      setMappings(prev => [...prev, { 
+        slice_index: selectedSlice, 
+        foley_filename: foleyFilename, 
+        gain: 1.0 
+      }]);
     }
     setMessage(`✅ Mapped slice #${selectedSlice + 1} to ${foleyFilename}`);
   };
 
+  // Compose final audio with foley replacements
   const handleCompose = async () => {
-    if (!filename || mappings.length === 0) return;
+    if (!filename || mappings.length === 0) {
+      setMessage('⚠️ No mappings to compose');
+      return;
+    }
     setComposing(true);
     setMessage('🎚️ Composing new audio...');
     try {
@@ -321,20 +400,23 @@ function App() {
     }
   };
 
+  // Fetch compose history
   const fetchComposeHistory = async () => {
     try {
       const r = await fetch('http://localhost:5001/api/compose-history');
       const data = await r.json();
       setComposeHistory(data.history || []);
     } catch (err) {
-      console.error('Failed to fetch compose history', err);
+      console.error('Failed to fetch compose history:', err);
     }
   };
 
+  // Load compose history on mount
   useEffect(() => {
     fetchComposeHistory();
   }, []);
 
+  // Play video with composed audio (synchronized)
   const playVideoWithComposed = () => {
     if (!videoRef.current || !composedAudioRef.current) return;
     const v = videoRef.current;
@@ -345,6 +427,8 @@ function App() {
     v.play();
     a.play();
     playingVideoComposedRef.current = true;
+    
+    // Sync interval to keep video and audio in sync
     const syncInterval = setInterval(() => {
       if (!playingVideoComposedRef.current) {
         clearInterval(syncInterval);
@@ -354,22 +438,26 @@ function App() {
         a.currentTime = v.currentTime;
       }
     }, 100);
+    
     v.onended = () => {
       a.pause();
       playingVideoComposedRef.current = false;
       clearInterval(syncInterval);
     };
+    
     v.onpause = () => {
       a.pause();
     };
   };
 
+  // Stop video with composed audio
   const stopVideoWithComposed = () => {
     if (videoRef.current) videoRef.current.pause();
     if (composedAudioRef.current) composedAudioRef.current.pause();
     playingVideoComposedRef.current = false;
   };
 
+  // Delete foley file
   const handleDeleteFoley = async (foleyFilename) => {
     if (!window.confirm(`Delete ${foleyFilename}?`)) return;
     try {
@@ -381,6 +469,8 @@ function App() {
       const data = await r.json();
       if (data.success) {
         setMessage(`✅ Deleted: ${foleyFilename}`);
+        // Remove any mappings using this foley
+        setMappings(prev => prev.filter(m => m.foley_filename !== foleyFilename));
         fetchFoleyLibrary();
       } else {
         setMessage(`❌ Delete failed: ${data.error}`);
@@ -388,6 +478,71 @@ function App() {
     } catch (err) {
       setMessage(`❌ Delete error: ${err.message}`);
     }
+  };
+
+  // Play foley file preview
+  const playFoleyPreview = async (foleyFilename) => {
+    try {
+      const r = await fetch(`http://localhost:5001/api/get-foley/${foleyFilename}`);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.play();
+      audio.onended = () => URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Failed to play foley:', err);
+      setMessage('❌ Failed to play foley');
+    }
+  };
+
+  // Analyze foley file (slice it into smaller samples)
+  const handleAnalyzeFoley = async (foleyFilename) => {
+    try {
+      setMessage(`🔍 Analyzing ${foleyFilename}...`);
+      
+      const response = await fetch('http://localhost:5001/api/slice-foley', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: foleyFilename,
+          method: 'onset',
+          min_duration: 0.03,
+          top_db: 30,
+          enhance: foleyEnhance  // 应用 Foley 增强
+        })
+      });
+      
+      const data = await response.json();
+      
+      if (data.success) {
+        let msg = `✅ Found ${data.slices.length} slices in ${foleyFilename}!`;
+        if (foleyEnhance) {
+          msg += ' 🎨 Enhanced.';
+        }
+        setMessage(msg);
+        fetchFoleyLibrary();
+      } else {
+        setMessage(`❌ Analysis failed: ${data.error}`);
+      }
+    } catch (err) {
+      console.error('Failed to analyze foley:', err);
+      setMessage('❌ Failed to analyze foley');
+    }
+  };
+
+  // Remove mapping
+  const removeMapping = (sliceIndex) => {
+    setMappings(prev => prev.filter(m => m.slice_index !== sliceIndex));
+    setMessage(`✅ Removed mapping for slice #${sliceIndex + 1}`);
+  };
+
+  // Update mapping gain
+  const updateMappingGain = (sliceIndex, newGain) => {
+    setMappings(prev => prev.map(m => 
+      m.slice_index === sliceIndex 
+        ? { ...m, gain: newGain } 
+        : m
+    ));
   };
 
   return (
@@ -444,6 +599,7 @@ function App() {
                     <input
                       type="number"
                       step="0.01"
+                      min="0.01"
                       value={minDuration}
                       onChange={(e) => setMinDuration(parseFloat(e.target.value))}
                     />
@@ -454,6 +610,8 @@ function App() {
                       <strong>Silence Threshold (dB):</strong>
                       <input
                         type="number"
+                        min="0"
+                        max="80"
                         value={topDb}
                         onChange={(e) => setTopDb(parseInt(e.target.value))}
                       />
@@ -474,23 +632,7 @@ function App() {
           </>
         ) : (
           <>
-            {/* Summary Cards */}
-            <div className="summary">
-              <div className="summary-card">
-                <div className="label">Total Duration</div>
-                <div className="value">{analysisData.duration.toFixed(1)}s</div>
-              </div>
-              <div className="summary-card">
-                <div className="label">Sound Events</div>
-                <div className="value">{analysisData.num_slices}</div>
-              </div>
-              <div className="summary-card">
-                <div className="label">Categories</div>
-                <div className="value">{analysisData.num_clusters}</div>
-              </div>
-            </div>
-
-            {/* Media Player */}
+            {/* Media Player - 移到最顶部 */}
             {file && (
               <section className="card">
                 <h2>🎬 Media Player</h2>
@@ -499,7 +641,15 @@ function App() {
                     ref={videoRef}
                     src={mediaUrl}
                     controls
-                    style={{ width: '100%', borderRadius: '8px' }}
+                    style={{ 
+                      width: '100%', 
+                      maxWidth: '600px',
+                      maxHeight: '400px',
+                      borderRadius: '8px',
+                      display: 'block',
+                      margin: '0 auto'
+                    }}
+                    onTimeUpdate={(e) => setCurrentTime(e.target.currentTime)}
                   />
                 ) : (
                   <audio
@@ -507,26 +657,50 @@ function App() {
                     src={mediaUrl}
                     controls
                     style={{ width: '100%' }}
+                    onTimeUpdate={(e) => setCurrentTime(e.target.currentTime)}
                   />
                 )}
               </section>
             )}
 
+            {/* Summary Cards */}
+            <div className="summary">
+              <div className="summary-card">
+                <div className="label">Total Duration</div>
+                <div className="value">{(analysisData?.duration || 0).toFixed(1)}s</div>
+              </div>
+              <div className="summary-card">
+                <div className="label">Sound Events</div>
+                <div className="value">{analysisData?.num_slices || 0}</div>
+              </div>
+              <div className="summary-card">
+                <div className="label">Categories</div>
+                <div className="value">{analysisData?.num_clusters || 0}</div>
+              </div>
+              <div className="summary-card">
+                <div className="label">Mappings</div>
+                <div className="value">{mappings.length}</div>
+              </div>
+            </div>
+
             {/* Timeline Editor */}
             <section className="card">
               <h2>🎬 TIMELINE EDITOR</h2>
               <p style={{ color: 'var(--text-dim)', marginBottom: '20px' }}>
-                Click on any sound event to preview. Different colors represent different sound categories.
+                Click on any sound event to preview. Different colors represent different sound types (8 categories).
+                {selectedSlice !== null && ` Selected: Slice #${selectedSlice + 1}`}
               </p>
               
               <div className="timeline-container">
                 <div className="timeline-track">
-                  {analysisData.timeline.map((seg, idx) => {
-                    const totalDuration = analysisData.duration;
-                    const left = (seg.start / totalDuration) * 100;
-                    const width = ((seg.end - seg.start) / totalDuration) * 100;
+                  {(analysisData?.slices || []).map((slice, idx) => {
+                    const totalDuration = analysisData?.duration || 1;
+                    const start = slice.features?.start_time || 0;
+                    const end = slice.features?.end_time || 0;
+                    const left = (start / totalDuration) * 100;
+                    const width = ((end - start) / totalDuration) * 100;
                     const isSelected = selectedSlice === idx;
-                    const isPlaying = playingSlice === analysisData.slices[idx];
+                    const isPlaying = playingSlice === slice;
 
                     return (
                       <div
@@ -535,14 +709,14 @@ function App() {
                         style={{
                           left: `${left}%`,
                           width: `${width}%`,
-                          background: getClusterColor(seg.cluster)
+                          background: getSoundTypeColor(slice.features?.type)  // 使用声音类型着色
                         }}
                         onClick={() => {
                           setSelectedSlice(idx);
-                          previewSlice(analysisData.slices[idx]);
+                          previewSlice(slice);
                         }}
                       >
-                        {seg.duration.toFixed(2)}s
+                        {(slice.features?.duration || 0).toFixed(2)}s
                       </div>
                     );
                   })}
@@ -551,23 +725,25 @@ function App() {
                 <div className="time-markers">
                   {[0, 0.25, 0.5, 0.75, 1].map((ratio) => (
                     <span key={ratio} style={{ left: `${ratio * 100}%` }}>
-                      {formatTime(analysisData.duration * ratio)}
+                      {formatTime((analysisData?.duration || 0) * ratio)}
                     </span>
                   ))}
                 </div>
 
                 <div className="legend">
-                  {Array.from(new Set(analysisData.slices.map(s => s.cluster))).sort().map((cluster) => {
-                    const slicesInCluster = analysisData.slices.filter(s => s.cluster === cluster);
-                    const types = [...new Set(slicesInCluster.map(s => s.features.type))];
+                  {/* 按声音类型分组显示 */}
+                  {['impact', 'metallic', 'friction', 'liquid', 'burst', 'resonant', 'ambient', 'continuous'].map((soundType) => {
+                    const slicesOfType = (analysisData?.slices || []).filter(s => s.features?.type === soundType);
+                    if (slicesOfType.length === 0) return null; // 不显示没有的类型
+                    
                     return (
-                      <div key={cluster} className="legend-item">
+                      <div key={soundType} className="legend-item">
                         <div
                           className="legend-color"
-                          style={{ background: getClusterColor(cluster) }}
+                          style={{ background: getSoundTypeColor(soundType) }}
                         />
                         <span>
-                          Category {cluster + 1}: {types.map(t => getSoundTypeLabel(t)).join(', ')} ({slicesInCluster.length} events)
+                          {getSoundTypeLabel(soundType)} ({slicesOfType.length} event{slicesOfType.length !== 1 ? 's' : ''})
                         </span>
                       </div>
                     );
@@ -576,184 +752,422 @@ function App() {
               </div>
             </section>
 
-            {/* Foley Resource Library & Compose History in two columns */}
+            {/* Foley Library & Compose History */}
             <section className="card">
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '30px' }}>
-
-                    {/* Foley library */}
-                    <section className="card">
-                      <h2>📚 Foley Resource Library</h2>
-                      <p style={{ color: 'var(--text-dim)' }}>Upload and manage your foley sound effects library.</p>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '30px' }}>
+                {/* Foley Library */}
+                <div>
+                  <h2>📚 Foley Resource Library</h2>
+                  <p style={{ color: 'var(--text-dim)', marginBottom: '10px' }}>
+                    Upload and manage your foley sound effects library.
+                  </p>
+                  
+                  <label className="upload-box" htmlFor="foley-upload" style={{ marginBottom: '15px', display: 'inline-block' }}>
+                    <span className="upload-text">
+                      {foleyUploading ? '⏳ Uploading...' : '➕ Upload Foley'}
+                    </span>
+                  </label>
+                  <input 
+                    id="foley-upload" 
+                    type="file" 
+                    accept="audio/*" 
+                    onChange={handleFoleyUpload} 
+                    style={{ display: 'none' }} 
+                    disabled={foleyUploading}
+                  />
+                  
+                  {/* Foley 音色增强选项 */}
+                  <div style={{ 
+                    marginBottom: '15px',
+                    padding: '12px', 
+                    background: 'rgba(118,75,162,0.05)', 
+                    borderRadius: '8px',
+                    border: '1px solid rgba(118,75,162,0.2)'
+                  }}>
+                    <label style={{ 
+                      display: 'flex', 
+                      alignItems: 'center',
+                      cursor: 'pointer',
+                      fontSize: '0.95em'
+                    }}>
+                      <input 
+                        type="checkbox" 
+                        checked={foleyEnhance}
+                        onChange={(e) => setFoleyEnhance(e.target.checked)}
+                        style={{ marginRight: '10px' }}
+                      />
+                      <div>
+                        <strong>🎨 Enable Timbre Enhancement</strong>
+                        <div style={{ 
+                          fontSize: '0.85em', 
+                          color: 'var(--text-dim)', 
+                          marginTop: '4px'
+                        }}>
+                          Automatically improve Foley sound quality when analyzing
+                        </div>
+                      </div>
+                    </label>
+                  </div>
+                  
+                  <div style={{ maxHeight: '400px', overflow: 'auto' }}>
+                    {foleyLibrary.length === 0 ? (
+                      <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-dim)' }}>
+                        No foley files yet. Upload some audio files to get started!
+                      </div>
+                    ) : (
                       <div style={{ display: 'grid', gap: '10px' }}>
                         {foleyLibrary.map((f, i) => (
-                          <div key={i} style={{ border: '1px solid rgba(0,0,0,0.06)', padding: '8px', borderRadius: '6px' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <div key={i} style={{ 
+                            border: '1px solid rgba(0,0,0,0.1)', 
+                            padding: '12px', 
+                            borderRadius: '6px',
+                            background: 'rgba(255,255,255,0.5)'
+                          }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
                               <strong>{f.filename}</strong>
                               <div style={{ display: 'flex', gap: '6px' }}>
-                                <button onClick={() => {
-                                  // play original foley file if directly available
-                                  fetch(`http://localhost:5001/api/get-foley/${f.filename}`).then(r=>r.blob()).then(b=>{const u=URL.createObjectURL(b); new Audio(u).play(); setTimeout(()=>URL.revokeObjectURL(u),5000)}).catch(()=>{});
-                                }}>▶️ Play</button>
-                                <button onClick={() => insertFoleyToSliceDirect(f.filename)} disabled={selectedSlice == null}>➕ Insert</button>
-                                <button onClick={() => handleDeleteFoley(f.filename)} style={{ color: '#a00' }}>🗑️ Delete</button>
+                                <button 
+                                  onClick={() => playFoleyPreview(f.filename)}
+                                  title="Play original file"
+                                >
+                                  ▶️ Play
+                                </button>
+                                <button 
+                                  onClick={() => handleAnalyzeFoley(f.filename)}
+                                  title="Analyze and slice this file"
+                                  disabled={f.slices && f.slices.length > 0}
+                                  style={{
+                                    background: f.slices && f.slices.length > 0 ? '#ccc' : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                                    color: 'white',
+                                    border: 'none'
+                                  }}
+                                >
+                                  🔍 Analyze
+                                </button>
+                                <button 
+                                  onClick={() => insertFoleyToSliceDirect(f.filename)} 
+                                  disabled={selectedSlice === null}
+                                  title="Map to selected slice"
+                                >
+                                  ➕ Insert
+                                </button>
+                                <button 
+                                  onClick={() => handleDeleteFoley(f.filename)} 
+                                  style={{ color: '#a00' }}
+                                  title="Delete file"
+                                >
+                                  🗑️
+                                </button>
                               </div>
                             </div>
-                            {f.slices && f.slices.length > 0 ? (
-                              <div style={{ marginTop: '6px' }}>
-                                <em>Slices:</em>
-                                <ul>
+                            
+                            {f.slices && f.slices.length > 0 && (
+                              <div style={{ marginTop: '8px', paddingLeft: '10px', borderLeft: '2px solid rgba(0,217,255,0.3)' }}>
+                                <em style={{ fontSize: '0.9em', color: 'var(--text-dim)' }}>
+                                  {f.slices.length} slice{f.slices.length !== 1 ? 's' : ''}:
+                                </em>
+                                <ul style={{ margin: '5px 0', paddingLeft: '20px' }}>
                                   {f.slices.map((s, idx) => (
-                                            <li key={idx} style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                                              <span style={{ flex: 1 }}>{s.filename}</span>
-                                              <button onClick={()=>{fetch(`http://localhost:5001/api/get-foley/${s.filename}`).then(r=>r.blob()).then(b=>{const u=URL.createObjectURL(b); new Audio(u).play(); setTimeout(()=>URL.revokeObjectURL(u),5000)}).catch(()=>{});}}>▶️</button>
-                                              <button onClick={() => insertFoleyToSliceDirect(s.filename)} disabled={selectedSlice == null}>➕ Insert</button>
-                                            </li>
-                                          ))}
+                                    <li key={idx} style={{ 
+                                      display: 'flex', 
+                                      gap: '8px', 
+                                      alignItems: 'center',
+                                      fontSize: '0.9em',
+                                      marginBottom: '4px'
+                                    }}>
+                                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                        {s.filename}
+                                      </span>
+                                      <button 
+                                        onClick={() => playFoleyPreview(s.filename)}
+                                        style={{ fontSize: '0.85em' }}
+                                      >
+                                        ▶️
+                                      </button>
+                                      <button 
+                                        onClick={() => insertFoleyToSliceDirect(s.filename)} 
+                                        disabled={selectedSlice === null}
+                                        style={{ fontSize: '0.85em' }}
+                                      >
+                                        ➕
+                                      </button>
+                                    </li>
+                                  ))}
                                 </ul>
                               </div>
-                            ) : (
-                              <div style={{ marginTop: '6px' }}><em>No slices available</em></div>
                             )}
                           </div>
                         ))}
                       </div>
-                    </section>
-
-                    {/* Compose history (audit log) */}
-                    <section className="card">
-                      <h2>🧾 Modification Log</h2>
-                      <p style={{ color: 'var(--text-dim)' }}>Recent compose operations and mappings (audit trail).</p>
-                      <div style={{ maxHeight: '240px', overflow: 'auto' }}>
-                        {composeHistory.length === 0 && <div>No compose history yet.</div>}
-                        {composeHistory.map((h, idx) => (
-                          <div key={idx} style={{ padding: '8px', borderBottom: '1px solid #eee' }}>
-                            <div><strong>{h.timestamp}</strong> — {h.original_file} → {h.composed_file}</div>
-                            <div style={{ fontSize: '0.9em', color: 'var(--text-dim)' }}>
-                              Mappings: {h.mappings.map(m => `${m.slice_index}@${m.foley_filename}`).join(', ')}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </section>
-
-                      </div>
-                    </section>
-
-            {/* list */}
-            <section className="card">
-              <h2>📝 Sound Events List</h2>
-              <div className="slices-list">
-                {analysisData.slices.map((slice, idx) => (
-                  <div
-                    key={idx}
-                    className={`slice-item ${selectedSlice === idx ? 'selected' : ''}`}
-                    onClick={() => {
-                      setSelectedSlice(idx);
-                      previewSlice(slice);
-                    }}
-                    style={{
-                      borderLeft: `4px solid ${getClusterColor(slice.cluster)}`
-                    }}
-                  >
-                    <div className="slice-info">
-                      <span className="slice-number">#{idx + 1}</span>
-                      <span className="slice-type">{getSoundTypeLabel(slice.features?.type)}</span>
-                      <span className="slice-time">
-                        {formatTime(slice.features?.start_time || 0)} → {formatTime(slice.features?.end_time || 0)}
-                      </span>
-                      <span className="slice-duration">
-                        {(slice.features?.duration || 0).toFixed(2)}s
-                      </span>
-                    </div>
-                    <div className="slice-features">
-                      <span>Energy: {((slice.features?.rms || 0) * 100).toFixed(1)}%</span>
-                      <span>Freq: {(slice.features?.spectral_centroid || 0).toFixed(0)} Hz</span>
-                      <span>Impact: {(slice.features?.onset_strength || 0).toFixed(2)}</span>
-                    </div>
+                    )}
                   </div>
-                ))}
+                </div>
+
+                {/* Compose History */}
+                <div>
+                  <h2>🧾 Modification Log</h2>
+                  <p style={{ color: 'var(--text-dim)', marginBottom: '10px' }}>
+                    Recent compose operations and mappings (audit trail).
+                  </p>
+                  <div style={{ maxHeight: '400px', overflow: 'auto' }}>
+                    {composeHistory.length === 0 ? (
+                      <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-dim)' }}>
+                        No compose history yet.
+                      </div>
+                    ) : (
+                      composeHistory.map((h, idx) => (
+                        <div key={idx} style={{ 
+                          padding: '12px', 
+                          borderBottom: '1px solid #eee',
+                          background: idx === 0 ? 'rgba(0,217,255,0.05)' : 'transparent'
+                        }}>
+                          <div style={{ marginBottom: '5px' }}>
+                            <strong>{h.timestamp}</strong>
+                          </div>
+                          <div style={{ fontSize: '0.9em', color: 'var(--text-dim)' }}>
+                            {h.original_file} → {h.composed_file}
+                          </div>
+                          <div style={{ fontSize: '0.85em', color: 'var(--text-dim)', marginTop: '4px' }}>
+                            Mappings: {h.mappings.map(m => `#${m.slice_index + 1}→${m.foley_filename}`).join(', ')}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
               </div>
             </section>
 
-            {/* buttons */}
+            {/* Sound Events List */}
+            <section className="card">
+              <h2>📝 Sound Events List</h2>
+              <div className="slices-list">
+                {(analysisData?.slices || []).map((slice, idx) => {
+                  const mapping = mappings.find(m => m.slice_index === idx);
+                  return (
+                    <div
+                      key={idx}
+                      className={`slice-item ${selectedSlice === idx ? 'selected' : ''}`}
+                      onClick={() => {
+                        setSelectedSlice(idx);
+                        previewSlice(slice);
+                      }}
+                      style={{
+                        borderLeft: `4px solid ${getSoundTypeColor(slice.features?.type)}`
+                      }}
+                    >
+                      <div className="slice-info">
+                        <span className="slice-number">#{idx + 1}</span>
+                        <span className="slice-type">{getSoundTypeLabel(slice.features?.type)}</span>
+                        <span className="slice-time">
+                          {formatTime(slice.features?.start_time || 0)} → {formatTime(slice.features?.end_time || 0)}
+                        </span>
+                        <span className="slice-duration">
+                          {(slice.features?.duration || 0).toFixed(2)}s
+                        </span>
+                      </div>
+                      <div className="slice-features">
+                        <span>Energy: {((slice.features?.rms || 0) * 100).toFixed(1)}%</span>
+                        <span>Freq: {(slice.features?.spectral_centroid || 0).toFixed(0)} Hz</span>
+                        <span>Impact: {(slice.features?.onset_strength || 0).toFixed(2)}</span>
+                      </div>
+                      {mapping && (
+                        <div style={{ 
+                          marginTop: '8px', 
+                          padding: '6px', 
+                          background: 'rgba(0,217,255,0.1)', 
+                          borderRadius: '4px',
+                          fontSize: '0.9em'
+                        }}>
+                          Mapped to: <strong>{mapping.foley_filename}</strong>
+                          <button 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              removeMapping(idx);
+                            }}
+                            style={{ marginLeft: '8px', fontSize: '0.85em' }}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+
+            {/* Actions */}
             <section className="card">
               <h2>🛠️ Actions</h2>
               <div className="actions">
-                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <label className="upload-box" htmlFor="foley-upload" style={{ padding: '6px 10px' }}>
-                    <span className="upload-text">➕ Upload Foley</span>
-                  </label>
-                  <input id="foley-upload" type="file" accept="audio/*" onChange={handleFoleyUpload} style={{ display: 'none' }} />
-                  <button onClick={fetchFoleyLibrary}>📚 Refresh Library</button>
+                {/* Quick Mapping UI */}
+                <div style={{ 
+                  padding: '15px', 
+                  background: 'rgba(0,217,255,0.05)', 
+                  borderRadius: '8px',
+                  marginBottom: '15px'
+                }}>
+                  <h3 style={{ marginTop: 0, fontSize: '1.1em' }}>Quick Mapping</h3>
+                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <select 
+                      value={selectedFoleyForSlice} 
+                      onChange={(e) => setSelectedFoleyForSlice(e.target.value)}
+                      style={{ flex: 1, minWidth: '200px' }}
+                    >
+                      <option value="">Select foley for slice #{selectedSlice !== null ? selectedSlice + 1 : '...'}</option>
+                      {foleyLibrary.map(f => (
+                        <option key={f.filename} value={f.filename}>{f.filename}</option>
+                      ))}
+                    </select>
+                    <button 
+                      onClick={insertFoleyToSlice} 
+                      disabled={selectedSlice === null || !selectedFoleyForSlice}
+                    >
+                      ➕ Insert Foley
+                    </button>
+                  </div>
+                  {selectedSlice !== null && analysisData?.slices?.[selectedSlice] && (
+                    <div style={{ marginTop: '8px', fontSize: '0.9em', color: 'var(--text-dim)' }}>
+                      Currently selected: Slice #{selectedSlice + 1} - {getSoundTypeLabel(analysisData.slices[selectedSlice].features.type)}
+                    </div>
+                  )}
                 </div>
 
-                {/* quick mapping UI */}
-                <div style={{ marginTop: '8px', display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <select value={selectedFoleyForSlice} onChange={(e) => setSelectedFoleyForSlice(e.target.value)}>
-                    <option value="">Select Foley for selected slice</option>
-                    {foleyLibrary.map(f => (
-                      <option key={f.filename} value={f.filename}>{f.filename}</option>
-                    ))}
-                  </select>
-                  <button onClick={insertFoleyToSlice} disabled={selectedSlice == null || !selectedFoleyForSlice}>Insert Foley</button>
-                  <button onClick={handleCompose} disabled={composing || mappings.length === 0}>{composing ? 'Composing...' : '🎚️ Compose'}</button>
-                </div>
-
-                {/* Current mappings */}
+                {/* Current Mappings */}
                 {mappings.length > 0 && (
-                  <div style={{ marginTop: '12px' }}>
-                    <strong>Current Mappings:</strong>
-                    <ul>
+                  <div style={{ 
+                    marginBottom: '15px', 
+                    padding: '15px', 
+                    background: 'rgba(118,75,162,0.05)', 
+                    borderRadius: '8px' 
+                  }}>
+                    <h3 style={{ marginTop: 0, fontSize: '1.1em' }}>
+                      Current Mappings ({mappings.length})
+                    </h3>
+                    <ul style={{ margin: 0, padding: 0, listStyle: 'none' }}>
                       {mappings.map((m, i) => (
-                        <li key={i} style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                          <span>Slice #{m.slice_index + 1}</span>
-                          <span style={{ color: 'var(--primary)' }}>{m.foley_filename}</span>
-                          <button onClick={() => {
-                            // remove mapping
-                            setMappings(prev => prev.filter(x => !(x.slice_index === m.slice_index && x.foley_filename === m.foley_filename)));
-                          }}>Remove</button>
+                        <li key={i} style={{ 
+                          display: 'flex', 
+                          gap: '8px', 
+                          alignItems: 'center',
+                          padding: '8px',
+                          background: 'white',
+                          marginBottom: '6px',
+                          borderRadius: '4px'
+                        }}>
+                          <span style={{ fontWeight: 'bold' }}>Slice #{m.slice_index + 1}</span>
+                          <span>→</span>
+                          <span style={{ color: 'var(--primary)', flex: 1 }}>{m.foley_filename}</span>
+                          <input 
+                            type="range" 
+                            min="0" 
+                            max="2" 
+                            step="0.1" 
+                            value={m.gain || 1.0}
+                            onChange={(e) => updateMappingGain(m.slice_index, parseFloat(e.target.value))}
+                            style={{ width: '80px' }}
+                            title={`Gain: ${(m.gain || 1.0).toFixed(1)}`}
+                          />
+                          <span style={{ fontSize: '0.85em', width: '40px' }}>
+                            {((m.gain || 1.0) * 100).toFixed(0)}%
+                          </span>
+                          <button 
+                            onClick={() => removeMapping(m.slice_index)}
+                            style={{ color: '#a00' }}
+                          >
+                            ✖
+                          </button>
                         </li>
                       ))}
                     </ul>
                   </div>
                 )}
 
+                {/* Compose Button */}
+                <button 
+                  onClick={handleCompose} 
+                  disabled={composing || mappings.length === 0}
+                  className="btn-primary"
+                  style={{ width: '100%', marginBottom: '15px' }}
+                >
+                  {composing ? '🎚️ Composing...' : `🎚️ Compose Audio (${mappings.length} mapping${mappings.length !== 1 ? 's' : ''})`}
+                </button>
+
+                {/* Composed Audio Player */}
                 {composedUrl && (
-                  <div style={{ marginTop: '8px' }}>
-                    <audio ref={composedAudioRef} src={composedUrl} controls style={{ width: '100%' }} />
-                    <div style={{ display: 'flex', gap: '8px', marginTop: '6px', alignItems: 'center' }}>
+                  <div style={{ 
+                    padding: '15px', 
+                    background: 'rgba(0,255,136,0.05)', 
+                    borderRadius: '8px',
+                    marginBottom: '15px'
+                  }}>
+                    <h3 style={{ marginTop: 0, fontSize: '1.1em' }}>✅ Composed Audio</h3>
+                    <audio 
+                      ref={composedAudioRef} 
+                      src={composedUrl} 
+                      controls 
+                      style={{ width: '100%', marginBottom: '10px' }} 
+                    />
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                       {fileType === 'video' && (
                         <>
-                          <button onClick={playVideoWithComposed}>▶️ Play Video with Composed Audio</button>
-                          <button onClick={stopVideoWithComposed}>⏹️ Stop</button>
+                          <button onClick={playVideoWithComposed}>
+                            ▶️ Play Video with Composed Audio
+                          </button>
+                          <button onClick={stopVideoWithComposed}>
+                            ⏹️ Stop
+                          </button>
                         </>
                       )}
-                      <a href={composedUrl} download={`${filename}_composed.wav`} style={{ marginLeft: '8px' }}>💾 Download Composed</a>
+                      <a 
+                        href={composedUrl} 
+                        download={`${filename}_composed.wav`}
+                        style={{ 
+                          display: 'inline-block',
+                          padding: '8px 16px',
+                          background: 'var(--primary)',
+                          color: 'white',
+                          textDecoration: 'none',
+                          borderRadius: '4px'
+                        }}
+                      >
+                        💾 Download Composed Audio
+                      </a>
                     </div>
                   </div>
                 )}
 
-                <button onClick={downloadJSON}>
-                  💾 Download Analysis JSON
-                </button>
-                <button onClick={() => {
-                  setAnalysisData(null);
-                  setFile(null);
-                  setFilename('');
-                  setMessage('');
-                }}>
-                  🔄 Analyze New File
-                </button>
-                <button
-                  onClick={() => alert('Hardware integration coming soon! This JSON can control Arduino/Raspberry Pi.')}
-                  style={{ background: 'linear-gradient(135deg, #764ba2 0%, #667eea 100%)' }}
-                >
-                  🔌 Send to Hardware
-                </button>
+                {/* Other Actions */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '10px' }}>
+                  <button onClick={downloadJSON}>
+                    💾 Download Analysis JSON
+                  </button>
+                  <button onClick={() => {
+                    setAnalysisData(null);
+                    setFile(null);
+                    setFilename('');
+                    setMessage('');
+                    setMappings([]);
+                    setComposedUrl(null);
+                    setSelectedSlice(null);
+                  }}>
+                    🔄 Analyze New File
+                  </button>
+                  <button
+                    onClick={() => alert('Hardware integration coming soon! This JSON can control Arduino/Raspberry Pi.')}
+                    style={{ background: 'linear-gradient(135deg, #764ba2 0%, #667eea 100%)' }}
+                  >
+                    🔌 Send to Hardware
+                  </button>
+                  <button onClick={fetchFoleyLibrary}>
+                    🔄 Refresh Library
+                  </button>
+                </div>
               </div>
             </section>
 
-            {/* JSON preview */}
+            {/* JSON Preview */}
             <details className="json-preview">
               <summary>👁️ View Raw JSON Data</summary>
               <pre>{JSON.stringify(analysisData, null, 2)}</pre>
@@ -763,7 +1177,7 @@ function App() {
       </main>
 
       {message && (
-        <div className={`message ${message.includes('✅') || message.includes('✨') ? 'success' : 'error'}`}>
+        <div className={`message ${message.includes('✅') || message.includes('✨') ? 'success' : message.includes('⚠️') ? 'warning' : 'error'}`}>
           {message}
         </div>
       )}

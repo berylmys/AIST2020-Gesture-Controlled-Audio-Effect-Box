@@ -19,7 +19,11 @@ import soundfile as sf
 import shutil
 from sklearn.cluster import KMeans
 from datetime import datetime
-
+from timbre_enhance import ( 
+    apply_timbre_preset,
+    generate_pitch_variants,
+    batch_enhance_directory
+)
 # Import our custom libraries
 import soundExtracting
 import videoProcessing
@@ -70,10 +74,15 @@ def analyze_slice_features(y, sr):
     
     return features
 
-def save_slice(y, sr, output_dir, base_name, idx, features):
-    """save slices"""
+def save_slice(y, sr, output_dir, base_name, idx, features, enhance=False):
+    """save slices with optional timbre enhancement"""
     y = normalize_audio(y)
     y = fade_in_out(y, sr, fade_ms=5)
+    
+    # 新增：如果启用增强，应用音色预设
+    if enhance:
+        sound_type = features.get('type', 'continuous')
+        y = apply_timbre_preset(y, sr, sound_type)
     
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +150,8 @@ def analyze_and_slice():
         method = data.get('method', 'onset')  # onset 或 silence
         min_duration = data.get('min_duration', 0.02)
         top_db = data.get('top_db', 30)
+        # 修正：原视频不需要增强
+        enhance = False
         
         if not filename:
             return jsonify({'success': False, 'error': 'No filename provided'}), 400
@@ -204,153 +215,8 @@ def analyze_and_slice():
             
             # 保存切片
             slice_info = save_slice(
-                slice_audio, sr, SLICES_FOLDER, base_name, idx, features
-            )
-            
-            slices_data.append(slice_info)
-            
-            print(f"  Slice {idx+1}: {start_time:.2f}s - {end_time:.2f}s "
-                  f"({features['duration']:.2f}s) [{features['type']}]")
-        
-        # 5. Group by sound type (8 categories) instead of clustering
-        print("\nGrouping by sound type...")
-        
-        # Get unique sound types from all slices
-        sound_types = list(set(s['features'].get('type', 'unknown') for s in slices_data))
-        sound_types.sort()  # 保持顺序一致
-        
-        # Create mapping from type to cluster number
-        type_to_cluster = {stype: idx for idx, stype in enumerate(sound_types)}
-        
-        # Assign cluster based on sound type
-        for s in slices_data:
-            sound_type = s['features'].get('type', 'unknown')
-            s['cluster'] = type_to_cluster[sound_type]
-        
-        n_clusters = len(sound_types)
-        print(f"Found {n_clusters} distinct sound types: {', '.join(sound_types)}")
-        
-        # Count slices per type
-        type_counts = {}
-        for s in slices_data:
-            stype = s['features'].get('type', 'unknown')
-            type_counts[stype] = type_counts.get(stype, 0) + 1
-        
-        for stype, count in type_counts.items():
-            print(f"  - {stype}: {count} events")
-        
-        # 6. Generate timeline data for UI
-        print("\nGenerating timeline visualization...")
-        timeline_data = []
-        for s in slices_data:
-            timeline_data.append({
-                'start': s['features']['start_time'],
-                'end': s['features']['end_time'],
-                'duration': s['features']['duration'],
-                'cluster': s['cluster'],
-                'type': s['features'].get('type', 'unknown'),
-                'type_label': s['features'].get('type_label', 'Unknown')
-            })
-        
-        print(f"\n{'='*60}")
-        print(f"✅ Analysis Complete!")
-        print(f"Total slices: {len(slices_data)}")
-        print(f"Sound categories: {n_clusters}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({
-            'success': True,
-            'num_slices': len(slices_data),
-            'num_clusters': n_clusters,
-            'duration': duration,
-            'slices': slices_data,
-            'timeline': timeline_data,
-            'sound_types': sound_types,
-            'type_counts': type_counts
-        })
-        
-    except Exception as e:
-        print("\n❌ Error during analysis:")
-        print(traceback.format_exc())
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }), 500
-    """
-    核心功能：分析并切片音频
-    支持：视频文件、音频文件、自定义参数
-    """
-    try:
-        data = request.json
-        filename = data.get('filename')
-        method = data.get('method', 'onset')  # onset 或 silence
-        min_duration = data.get('min_duration', 0.02)
-        top_db = data.get('top_db', 30)
-        
-        if not filename:
-            return jsonify({'success': False, 'error': 'No filename provided'}), 400
-        
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
-        if not os.path.exists(filepath):
-            return jsonify({'success': False, 'error': 'File not found'}), 404
-        
-        print(f"\n{'='*60}")
-        print(f"Processing: {filename}")
-        print(f"Method: {method}, Min Duration: {min_duration}s")
-        print(f"{'='*60}\n")
-        
-        # 1. Extract audio (use videoProcessing library for videos)
-        if videoProcessing.is_video_file(filepath):
-            print("Extracting audio from video...")
-            temp_audio = os.path.join(OUTPUT_FOLDER, 'temp_extracted_audio.wav')
-            audio_path = videoProcessing.extract_audio_from_video(filepath, temp_audio)
-            if not audio_path:
-                return jsonify({'success': False, 'error': 'Audio extraction failed'}), 500
-        else:
-            audio_path = filepath
-        
-        # 2. load audio
-        print("Loading audio...")
-        y, sr = load_audio(audio_path)
-        duration = len(y) / sr
-        print(f"Duration: {duration:.2f} seconds\n")
-        
-        # 3. slice detection
-        print(f"Detecting slices using {method} method...")
-        if method == 'onset':
-            intervals = detect_onset_slices(y, sr, min_duration=min_duration)
-        else:
-            intervals = detect_silence_slices(y, sr, top_db=top_db, min_duration=min_duration)
-        
-        print(f"Found {len(intervals)} slices\n")
-        
-        if len(intervals) == 0:
-            return jsonify({
-                'success': False,
-                'error': 'No slices detected. Try adjusting parameters.',
-                'suggestion': 'Lower min_duration or sensitivity'
-            }), 400
-        
-        # 4. processing slices
-        print("Processing slices...")
-        slices_data = []
-        base_name = Path(filename).stem
-        
-        for idx, (start, end) in enumerate(intervals):
-            slice_audio = y[start:end]
-            start_time = start / sr
-            end_time = end / sr
-            
-            # 分析特征
-            features = analyze_slice_features(slice_audio, sr)
-            features['start_time'] = start_time
-            features['end_time'] = end_time
-            features['duration'] = end_time - start_time
-            
-            # 保存切片
-            slice_info = save_slice(
-                slice_audio, sr, SLICES_FOLDER, base_name, idx, features
+                slice_audio, sr, SLICES_FOLDER, base_name, idx, features,
+                enhance=enhance  # 传递增强参数
             )
             
             slices_data.append(slice_info)
@@ -366,219 +232,379 @@ def analyze_and_slice():
         n_clusters = min(4, len(slices_data))
         
         if n_clusters > 1:
-            # Use comprehensive feature set for better clustering
-            X = np.array([[
-                s['features'].get('rms', 0),
-                s['features'].get('zcr', 0),
-                s['features'].get('spectral_centroid', 0),
-                s['features'].get('spectral_bandwidth', 0),
-                s['features'].get('onset_strength', 0),
-                s['features'].get('duration', 0),
-                s['features'].get('spec_rolloff', 0),
-                s['features'].get('spec_flatness', 0)
-            ] for s in slices_data])
-            
-            # Normalize features for better clustering
-            X_normalized = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(X_normalized)
-            
-            for i, label in enumerate(labels):
-                slices_data[i]['cluster'] = int(label)
-        else:
+            feature_vectors = []
             for s in slices_data:
-                s['cluster'] = 0
+                f = s['features']
+                vec = [
+                    f.get('rms', 0),
+                    f.get('zcr', 0),
+                    f.get('spec_cent', 0),
+                    f.get('spec_bw', 0),
+                    f.get('onset_strength', 0),
+                    f.get('duration', 0),
+                    f.get('spec_rolloff', 0),
+                    f.get('spec_flatness', 0),
+                    f.get('mfcc1', 0),
+                    f.get('mfcc2', 0),
+                    f.get('mfcc3', 0)
+                ]
+                feature_vectors.append(vec)
+            
+            X = np.array(feature_vectors)
+            X_mean = X.mean(axis=0)
+            X_std = X.std(axis=0) + 1e-8
+            X_normalized = (X - X_mean) / X_std
+            
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit(X_normalized)
+            
+            clusters_result = []
+            for cluster_id in range(n_clusters):
+                member_indices = [i for i, label in enumerate(kmeans.labels_) if label == cluster_id]
+                members = [slices_data[i] for i in member_indices]
+                
+                # Representative feature: use centroid features
+                avg_features = {}
+                for key in ['rms', 'zcr', 'spec_cent', 'duration']:
+                    vals = [m['features'].get(key, 0) for m in members]
+                    avg_features[key] = float(np.mean(vals)) if vals else 0.0
+                
+                # Most common type in cluster
+                types_in_cluster = [m['features'].get('type', 'unknown') for m in members]
+                from collections import Counter
+                dominant_type = Counter(types_in_cluster).most_common(1)[0][0] if types_in_cluster else 'unknown'
+                
+                clusters_result.append({
+                    'cluster_id': int(cluster_id),
+                    'count': len(members),
+                    'members': member_indices,
+                    'avg_features': avg_features,
+                    'dominant_type': dominant_type
+                })
+            
+            print(f"Clustered into {n_clusters} groups\n")
+        else:
+            clusters_result = [{
+                'cluster_id': 0,
+                'count': len(slices_data),
+                'members': list(range(len(slices_data))),
+                'avg_features': {},
+                'dominant_type': slices_data[0]['features'].get('type', 'unknown') if slices_data else 'unknown'
+            }]
         
-        # 6. 组织结果
-        result = {
+        # 6. Generate timeline for UI visualization
+        print("Generating timeline data...")
+        timeline_data = []
+        for idx, s in enumerate(slices_data):
+            f = s['features']
+            timeline_data.append({
+                'index': idx,
+                'start': f.get('start_time', 0),
+                'end': f.get('end_time', 0),
+                'duration': f.get('duration', 0),
+                'type': f.get('type', 'unknown'),
+                'filename': s['filename']
+            })
+        
+        print("✓ Processing complete!\n")
+        
+        return jsonify({
             'success': True,
-            'original_file': filename,
-            'total_duration': duration,
-            'num_slices': len(slices_data),
-            'num_clusters': n_clusters,
             'slices': slices_data,
-            'method': method,
-            'parameters': {
-                'min_duration': min_duration,
-                'top_db': top_db if method == 'silence' else None
+            'clusters': clusters_result,
+            'timeline': timeline_data,
+            'sound_types': sound_types,
+            'stats': {
+                'total_slices': len(slices_data),
+                'duration': duration,
+                'method': method
             }
-        }
-        
-        # 7. 保存结果
-        result_path = os.path.join(OUTPUT_FOLDER, f'{base_name}_analysis.json')
-        with open(result_path, 'w') as f:
-            json.dump(result, f, indent=2)
-        
-        print(f"\n✓ Analysis complete! Saved to {result_path}\n")
-        
-        # 清理临时文件
-        if 'temp_extracted_audio.wav' in audio_path:
-            try:
-                os.remove(audio_path)
-            except:
-                pass
-        
-        return jsonify(result)
+        })
     
     except Exception as e:
-        print(f"Error: {str(e)}")
         print(traceback.format_exc())
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/get-slice/<filename>')
 def get_slice(filename):
-    """获取音频切片文件"""
+    """Serve a slice audio file"""
     try:
-        filepath = os.path.join(SLICES_FOLDER, filename)
+        filepath = os.path.join(SLICES_FOLDER, secure_filename(filename))
         if not os.path.exists(filepath):
             return jsonify({'error': 'File not found'}), 404
         return send_file(filepath, mimetype='audio/wav')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/upload-foley', methods=['POST'])
 def upload_foley():
-    """Upload a custom foley sample into the server library"""
+    """Upload a foley sound to the library (with automatic slicing)"""
     try:
         if 'file' not in request.files:
             return jsonify({'success': False, 'error': 'No file provided'}), 400
+        
         file = request.files['file']
         if file.filename == '':
             return jsonify({'success': False, 'error': 'Empty filename'}), 400
-
+        
         filename = secure_filename(file.filename)
-        dest = os.path.join(FOLEY_FOLDER, filename)
-        file.save(dest)
-
-        # analyze basic features for search/filtering and slice the uploaded foley
+        filepath = os.path.join(FOLEY_FOLDER, filename)
+        file.save(filepath)
+        
+        # 🆕 AUTO-SLICE: Analyze and slice the uploaded foley (like original version)
         try:
-            # create per-foley slice folder
+            # Create per-foley slice folder
             base = Path(filename).stem
             foley_slice_dir = os.path.join(FOLEY_FOLDER, f"{base}_slices")
             os.makedirs(foley_slice_dir, exist_ok=True)
-
-            # use soundExtracting.process_file to create slices and features
-            slice_paths, slice_features = soundExtracting.process_file(dest, foley_slice_dir, method='silence', analyze=True)
+            
+            # Use soundExtracting.process_file to create slices and features
+            slice_paths, slice_features = soundExtracting.process_file(
+                filepath, 
+                foley_slice_dir, 
+                method='silence',  # Default method
+                analyze=True
+            )
+            
             features = {
                 'slice_count': len(slice_paths),
                 'slices': [
                     {
                         'path': p,
+                        'filename': os.path.basename(p),
                         'features': f
                     } for p, f in zip(slice_paths, slice_features)
                 ]
             }
-        except Exception:
+        except Exception as slice_error:
+            # Fallback: If slicing fails, just analyze the whole file
+            print(f"Auto-slicing failed: {slice_error}, falling back to whole file analysis")
             try:
-                y, sr = load_audio(dest)
+                y, sr = load_audio(filepath)
                 features = analyze_slice_features(y, sr)
+                features['slice_count'] = 0
             except Exception:
-                features = {}
-
-        # persist metadata
+                features = {'slice_count': 0}
+        
+        # Store in DB
         db = []
-        try:
-            if os.path.exists(FOLEY_DB):
+        if os.path.exists(FOLEY_DB):
+            try:
                 with open(FOLEY_DB, 'r', encoding='utf-8') as f:
                     db = json.load(f)
-        except Exception:
-            db = []
-
+            except Exception:
+                db = []
+        
+        # Check if exists and remove old entry
+        db = [e for e in db if e.get('filename') != filename]
+        
+        # Add new entry
         entry = {
             'filename': filename,
-            'path': dest,
+            'path': filepath,
             'features': features,
-            'slices_dir': os.path.join(FOLEY_FOLDER, f"{Path(filename).stem}_slices") if features and features.get('slice_count',0)>0 else None
+            'slices_dir': os.path.join(FOLEY_FOLDER, f"{Path(filename).stem}_slices") if features.get('slice_count', 0) > 0 else None,
+            'uploaded_at': datetime.utcnow().isoformat() + 'Z'
         }
         db.append(entry)
-        with open(FOLEY_DB, 'w', encoding='utf-8') as f:
-            json.dump(db, f, indent=2)
-
-        return jsonify({'success': True, 'entry': entry})
+        
+        try:
+            with open(FOLEY_DB, 'w', encoding='utf-8') as f:
+                json.dump(db, f, indent=2)
+        except Exception:
+            pass
+        
+        return jsonify({
+            'success': True,
+            'filename': filename,
+            'entry': entry
+        })
+    
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/slice-foley', methods=['POST'])
+def slice_foley():
+    """
+    Slice a foley file into smaller samples and store them in a subfolder.
+    Expects JSON: { 'filename': 'name.wav', 'method': 'onset', 'min_duration': 0.02 }
+    Returns: { 'success': true, 'slices': [...], 'slices_dir': '...' }
+    """
+    try:
+        data = request.json
+        if not data or 'filename' not in data:
+            return jsonify({'success': False, 'error': 'filename required'}), 400
+        
+        filename = secure_filename(data['filename'])
+        method = data.get('method', 'onset')
+        min_duration = data.get('min_duration', 0.02)
+        top_db = data.get('top_db', 30)
+        
+        # foley enhancement
+        enhance = data.get('enhance', False)
+        
+        filepath = os.path.join(FOLEY_FOLDER, filename)
+        if not os.path.exists(filepath):
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+        
+        # load audio
+        y, sr = load_audio(filepath)
+        
+        # detect slices
+        if method == 'onset':
+            intervals = detect_onset_slices(y, sr, min_duration=min_duration)
+        else:
+            intervals = detect_silence_slices(y, sr, top_db=top_db, min_duration=min_duration)
+        
+        if len(intervals) == 0:
+            return jsonify({'success': False, 'error': 'No slices detected'}), 400
+        
+        # create subdirectory for slices
+        base_name = Path(filename).stem
+        slices_dir = os.path.join(FOLEY_FOLDER, f"{base_name}_slices")
+        os.makedirs(slices_dir, exist_ok=True)
+        
+        # save slices
+        slices_data = []
+        for idx, (start, end) in enumerate(intervals):
+            slice_audio = y[start:end]
+            start_time = start / sr
+            end_time = end / sr
+            
+            features = analyze_slice_features(slice_audio, sr)
+            features['start_time'] = start_time
+            features['end_time'] = end_time
+            features['duration'] = end_time - start_time
+            
+            # save to slices_dir
+            slice_info = save_slice(
+                slice_audio, sr, slices_dir, base_name, idx, features,
+                enhance=enhance  #  Foley enhancement
+            )
+            slices_data.append(slice_info)
+        
+        # update DB entry
+        db = []
+        if os.path.exists(FOLEY_DB):
+            try:
+                with open(FOLEY_DB, 'r', encoding='utf-8') as f:
+                    db = json.load(f)
+            except Exception:
+                db = []
+        
+        for e in db:
+            if e.get('filename') == filename:
+                e['slices'] = slices_data
+                e['slices_dir'] = slices_dir
+                break
+        
+        try:
+            with open(FOLEY_DB, 'w', encoding='utf-8') as f:
+                json.dump(db, f, indent=2)
+        except Exception:
+            pass
+        
+        return jsonify({'success': True, 'slices': slices_data, 'slices_dir': slices_dir})
+    
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/foley-library', methods=['GET'])
-def foley_library():
+def get_foley_library():
+    """Return all foley files in the library"""
     try:
         db = []
         if os.path.exists(FOLEY_DB):
-            with open(FOLEY_DB, 'r', encoding='utf-8') as f:
-                db = json.load(f)
-
-        # augment entries with slice listing if available
-        for entry in db:
-            slices_dir = entry.get('slices_dir')
-            entry['slices'] = []
-            if slices_dir and os.path.exists(slices_dir):
-                files = sorted([f for f in os.listdir(slices_dir) if f.lower().endswith('.wav')])
-                for fn in files:
-                    entry['slices'].append({'filename': fn, 'path': os.path.join(slices_dir, fn)})
-
-        # if db empty, auto-scan FOLEY_FOLDER
-        if not db:
-            files = [f for f in os.listdir(FOLEY_FOLDER) if f.lower().endswith(('.wav', '.mp3', '.flac', '.m4a', '.ogg'))]
-            for fn in files:
-                db.append({'filename': fn, 'path': os.path.join(FOLEY_FOLDER, fn), 'features': {}, 'slices': []})
+            try:
+                with open(FOLEY_DB, 'r', encoding='utf-8') as f:
+                    db = json.load(f)
+            except Exception:
+                db = []
         return jsonify({'success': True, 'library': db})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-
 @app.route('/api/compose-history', methods=['GET'])
-def compose_history():
+def get_compose_history():
+    """
+    🆕 NEW ENDPOINT: Get composition history
+    Returns list of previous compose operations for reference
+    """
     try:
         history = []
         if os.path.exists(COMPOSE_HISTORY):
-            with open(COMPOSE_HISTORY, 'r', encoding='utf-8') as f:
-                history = json.load(f)
+            try:
+                with open(COMPOSE_HISTORY, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
         return jsonify({'success': True, 'history': history})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
+        return jsonify({'success': False, 'error': str(e), 'history': []}), 500
 
 @app.route('/api/compose', methods=['POST'])
-def compose_with_foley():
-    """Compose original audio with selected foley samples inserted at detected slice positions.
-    Expected JSON payload:
-      {
-        'filename': '<original uploaded filename>',
-        'slices': [ ... ]  # analysisData.slices from analyze-and-slice
-        'mappings': [ { 'slice_index': 0, 'foley_filename': 'kick.wav', 'gain': 1.0 }, ... ]
-      }
-    Returns: generated mixed audio path
+def compose_audio():
+    """
+    Compose a new audio track by replacing slices with foley samples.
+    Expects JSON:
+    {
+      'filename': 'original.wav',
+      'mappings': [
+        {'slice_index': 0, 'foley_filename': 'kick.wav', 'gain': 1.0},
+        {'slice_index': 2, 'foley_filename': 'snare.wav', 'gain': 0.8},
+        ...
+      ]
+    }
+    Returns: { 'success': true, 'composed': 'composed.wav', 'path': '...' }
     """
     try:
         data = request.json
-        filename = data.get('filename')
-        slices = data.get('slices', [])
+        if not data or 'filename' not in data:
+            return jsonify({'success': False, 'error': 'filename required'}), 400
+        filename = data['filename']
         mappings = data.get('mappings', [])
 
-        if not filename or not slices or not mappings:
-            return jsonify({'success': False, 'error': 'filename, slices and mappings are required'}), 400
-
-        upload_path = os.path.join(UPLOAD_FOLDER, filename)
-        if not os.path.exists(upload_path):
+        # load original audio (or temp_extracted if video)
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        if not os.path.exists(filepath):
             return jsonify({'success': False, 'error': 'Original file not found'}), 404
 
-        # If video, extract its audio first (use videoProcessing library)
-        if videoProcessing.is_video_file(upload_path):
+        # check if video -> extract audio again
+        if videoProcessing.is_video_file(filepath):
             temp_audio = os.path.join(OUTPUT_FOLDER, 'temp_compose_audio.wav')
-            audio_path = videoProcessing.extract_audio_from_video(upload_path, temp_audio)
-            if not audio_path:
+            src_audio_path = videoProcessing.extract_audio_from_video(filepath, temp_audio)
+            if not src_audio_path:
                 return jsonify({'success': False, 'error': 'Audio extraction failed'}), 500
-            src_audio_path = audio_path
         else:
-            src_audio_path = upload_path
+            src_audio_path = filepath
 
-        y, sr = load_audio(src_audio_path)
+        y, sr = load_audio(src_audio_path, sr=None)
         out = y.copy()
 
-        # For each mapping, replace the entire slice region with the foley slice
+        # find slices metadata
+        # We assume slices are stored for this file (analyze-and-slice was called before)
+        # read from slices folder
+        base_name = Path(filename).stem
+        slices_files = sorted([f for f in os.listdir(SLICES_FOLDER) if f.startswith(base_name + '_slice') and f.endswith('.wav')])
+        if len(slices_files) == 0:
+            return jsonify({'success': False, 'error': 'No slices found for this file. Please analyze first.'}), 400
+
+        # load each slice's metadata (we saved features in slice files, but we can also parse them)
+        # For simplicity, we'll re-detect slices quickly
+        # But ideally we'd store slice info in a session or DB. For MVP, re-slice:
+        intervals = detect_onset_slices(y, sr, min_duration=0.02)
+        slices = []
+        for idx, (start, end) in enumerate(intervals):
+            slice_audio = y[start:end]
+            start_time = start / sr
+            end_time = end / sr
+            features = analyze_slice_features(slice_audio, sr)
+            features['start_time'] = start_time
+            features['end_time'] = end_time
+            slices.append({'features': features})
+
+        # apply mappings
         for m in mappings:
-            idx = int(m.get('slice_index'))
+            idx = int(m.get('slice_index', -1))
             foley_fn = m.get('foley_filename')
             gain = float(m.get('gain', 1.0))
             if idx < 0 or idx >= len(slices):
@@ -781,9 +807,39 @@ def delete_foley():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/enhance-slice', methods=['POST'])
+def enhance_single_slice():
+    try:
+        data = request.json
+        slice_path = data.get('slice_path')
+        sound_type = data.get('sound_type', 'continuous')
+        
+        if not slice_path or not os.path.exists(slice_path):
+            return jsonify({'success': False, 'error': 'Invalid slice path'}), 400
+        
+        # load audio files
+        y, sr = load_audio(slice_path)
+        
+        # apply enhancement
+        y_enhanced = apply_timbre_preset(y, sr, sound_type)
+        
+        # save enhanced version
+        path_obj = Path(slice_path)
+        enhanced_filename = f"{path_obj.stem}_enhanced{path_obj.suffix}"
+        enhanced_path = str(path_obj.parent / enhanced_filename)
+        sf.write(enhanced_path, y_enhanced, sr)
+        
+        return jsonify({
+            'success': True,
+            'enhanced_path': enhanced_path,
+            'filename': enhanced_filename
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/demo-files', methods=['GET'])
 def get_demo_files():
-    """获取演示文件列表"""
     demo_files = [
         {'name': 'Knife on Glass', 'file': 'Knife_glass.wav'},
         {'name': 'Boiling Water', 'file': 'boilingWater.wav'},
@@ -802,5 +858,6 @@ if __name__ == '__main__':
     print("  ✓ Smart audio slicing (onset/silence)")
     print("  ✓ Feature analysis & clustering")
     print("  ✓ Timeline generation for UI")
+    print("  ✓ Timbre enhancement & pitch variants")  
     print("="*60)
     app.run(debug=True, port=5001, host='0.0.0.0')

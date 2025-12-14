@@ -5,6 +5,7 @@ import numpy as np
 import librosa
 import soundfile as sf
 from sklearn.cluster import KMeans
+from timbre_enhance import apply_timbre_preset, generate_pitch_variants
 
 # Utility to extract, analyze and slice audio files into foley samples.
 # Usage examples:
@@ -139,6 +140,7 @@ def get_type_label(sound_type):
         'ambient': {'en': 'Ambient'},
         'continuous': {'en': 'Continuous'}
     }
+    return labels.get(sound_type, {'en': 'Unknown'})['en']
 
 def analyze_slice(y, sr):
     # simple feature vector: RMS, ZCR, spectral centroid, mfcc mean (first 3)
@@ -182,11 +184,21 @@ def analyze_slice(y, sr):
 
     return features
 
-def save_slice(y, sr, outdir, base_name, idx, fmt='wav', normalize=True, fade_ms=6):
+def save_slice(y, sr, outdir, base_name, idx, fmt='wav', normalize=True, fade_ms=6, enhance=False, sound_type=None):
+    # ⚠️ 重要：先保存原始切片的副本，避免被增强函数污染
+    y_original = y.copy()
+    
     if normalize:
         y = normalize_audio(y)
     if fade_ms and sr:
         y = fade_in_out(y, sr, fade_ms=fade_ms)
+    
+    # 只在需要时才应用增强
+    if enhance and sound_type:
+        # 使用独立的副本进行增强
+        y_for_enhance = y.copy()
+        y = apply_timbre_preset(y_for_enhance, sr, sound_type)
+    
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     out_path = outdir / f"{base_name}_slice{idx:03d}.{fmt}"
@@ -254,7 +266,7 @@ def cluster_and_mix(slice_features, slice_paths, n_clusters=4, mixes_per_cluster
             mixes.append(out_path)
     return mixes
 
-def process_file(path, outdir, method='silence', top_db=30, min_duration=0.03, analyze=True):
+def process_file(path, outdir, method='silence', top_db=30, min_duration=0.03, analyze=True, enhance=False):
     y, sr = load_audio(path)
     base = Path(path).stem
     if method == 'silence':
@@ -267,10 +279,17 @@ def process_file(path, outdir, method='silence', top_db=30, min_duration=0.03, a
     features = []
     for i, (s, e) in enumerate(intervals):
         ys = y[s:e]
-        p = save_slice(ys, sr, outdir, base, i)
-        slice_paths.append(str(p))
+        # 先分析特征以获取sound_type
+        feats = None
         if analyze:
-            features.append(analyze_slice(ys, sr))
+            feats = analyze_slice(ys, sr)
+            features.append(feats)
+        
+        # 根据分类结果决定是否增强
+        sound_type = feats.get('type') if feats else None
+        p = save_slice(ys, sr, outdir, base, i, enhance=enhance, sound_type=sound_type)
+        slice_paths.append(str(p))
+    
     return slice_paths, features
 
 def main():
@@ -282,6 +301,9 @@ def main():
     parser.add_argument('--min-duration', type=float, default=0.03)
     parser.add_argument('--cluster-mix', action='store_true', help='cluster slices and make mixes')
     parser.add_argument('--clusters', type=int, default=4)
+    parser.add_argument('--enhance', action='store_true', help='Apply timbre enhancement based on sound type')
+    parser.add_argument('--generate-variants', action='store_true', help='Generate pitch variants for each slice')
+    parser.add_argument('--n-variants', type=int, default=5, help='Number of pitch variants to generate')
     args = parser.parse_args()
 
     files = find_audio_files(args.input)
@@ -289,9 +311,32 @@ def main():
     all_features = []
     for f in files:
         print("Processing:", f)
-        paths, feats = process_file(f, args.outdir, method=args.method, top_db=args.top_db, min_duration=args.min_duration)
+        paths, feats = process_file(f, args.outdir, method=args.method, top_db=args.top_db, 
+                                   min_duration=args.min_duration, enhance=args.enhance)
         all_slice_paths.extend(paths)
         all_features.extend(feats)
+
+
+    if args.generate_variants and all_features:
+        print("\nGenerating pitch variants...")
+        variant_count = 0
+        for slice_path, features in zip(all_slice_paths, all_features):
+            sound_type = features.get('type', 'continuous')
+            
+            y, sr = load_audio(slice_path)
+            
+            variants = generate_pitch_variants(y, sr, n_variants=args.n_variants, semitone_range=(-7, 7))
+            
+            slice_base = Path(slice_path).stem
+            slice_dir = Path(slice_path).parent
+            
+            for var_idx, (semitones, y_variant) in enumerate(variants):
+                if abs(semitones) > 0.1:  
+                    variant_path = slice_dir / f"{slice_base}_var{var_idx:02d}_st{semitones:+.1f}.wav"
+                    sf.write(str(variant_path), y_variant, sr)
+                    variant_count += 1
+        
+        print(f"Generated {variant_count} pitch variants")
 
     if args.cluster_mix and all_features:
         print("Clustering and creating mixes...")
